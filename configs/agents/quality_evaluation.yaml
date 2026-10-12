@@ -1,0 +1,20 @@
+agent_type: quality_evaluation_agent
+name: 质量评估 Agent
+version: 1.0.0
+description: 负责评估候选图谱和证据覆盖情况；候选本体直接交给用户审核。
+accepted_subtask_types:
+  - graph_quality_evaluate
+  - evidence_quality_evaluate
+accepted_input_types:
+  - CandidateGraph
+  - EvidenceDataset
+  - ConflictReport
+produced_output_types:
+  - GraphQualityReport
+allowed_skills:
+  - evaluate_graph_quality
+  - evaluate_evidence_coverage
+can_publish_subtasks: false
+can_publish_ontology: false
+can_publish_graph: false
+lifecycle: ACTIVE

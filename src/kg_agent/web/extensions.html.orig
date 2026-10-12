@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>自定义 Agent 与 Skill 管理</title>
+    <link rel="stylesheet" href="/workbench-assets/extensions.css?v=20260924-2" />
+  </head>
+  <body>
+    <main class="extension-shell">
+      <header>
+        <div>
+          <p class="eyebrow">知识图谱 Agent 平台</p>
+          <h1>自定义 Agent 与 Skill</h1>
+          <p class="subtitle">在这里查看、编辑、发布、停用或删除已有能力。编辑会先生成草稿，确认发布后才替换正在使用的版本。</p>
+        </div>
+        <a href="/workbench">返回任务工作台</a>
+      </header>
+
+      <p id="notice" class="notice" aria-live="polite">正在读取已发布能力目录…</p>
+
+      <section class="catalog">
+        <article class="panel" data-extension-section="skills">
+          <h2>自定义 Skills</h2>
+          <div id="skills-list" class="definition-list"></div>
+        </article>
+        <article class="panel" data-extension-section="agents">
+          <h2>自定义 Agents</h2>
+          <div id="agents-list" class="definition-list"></div>
+        </article>
+      </section>
+    </main>
+    <!-- 管理页按 tab 参数切换展示内容；版本参数避免浏览器沿用旧版总览脚本。 -->
+    <script type="module" src="/workbench-assets/extensions.js?v=20261008-1"></script>
+  </body>
+</html>

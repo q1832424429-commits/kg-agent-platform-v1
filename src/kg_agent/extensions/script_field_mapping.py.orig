@@ -1,0 +1,674 @@
+"""将已确认的脚本字段映射应用到正式 Artifact 内容。
+
+
+本模块只解析显式 JSON Pointer，不推断语义、不补造缺失值，也不访问外部服务。
+"""
+
+from __future__ import annotations
+
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+
+class ScriptInputFieldBinding(BaseModel):
+    """绑定一个脚本参数名到一个已有 Artifact 的确定字段。"""
+
+    script_field: str = Field(pattern=r"^[a-zA-Z_][a-zA-Z0-9_]{0,127}$")
+    artifact_type: str = Field(min_length=1)
+    source_pointer: str = Field(min_length=1)
+    required: bool = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_removed_source(cls, value: Any) -> Any:
+        """拒绝历史的非标准来源，同时允许旧修订显式标注标准内容来源。"""
+
+        if isinstance(value, dict) and value.get("source_scope", "CONTENT") != "CONTENT":
+            raise ValueError("脚本输入只能读取标准 Artifact 内容")
+        return value
+
+    @field_validator("source_pointer")
+    @classmethod
+    def validate_pointer(cls, value: str) -> str:
+        """要求字段路径是指向 Artifact content 的绝对 JSON Pointer。"""
+
+        if not value.startswith("/") or value == "/":
+            raise ValueError("source_pointer 必须是以 / 开头的内容字段路径")
+        return value
+
+
+class EntityRecordAdapter(BaseModel):
+    """将用户的单实体函数绑定到现有实体转换契约，不改变实体身份与证据。"""
+
+    function_name: str = Field(pattern=r"^[a-zA-Z_][a-zA-Z0-9_]{0,127}$")
+    parameter_name: str = Field(pattern=r"^[a-zA-Z_][a-zA-Z0-9_]{0,127}$")
+    source_field: Literal["name"] = "name"
+    result_field: str = Field(pattern=r"^[a-zA-Z_][a-zA-Z0-9_]{0,127}$")
+    target_field: Literal["name"] = "name"
+
+
+class ScriptFunctionArgument(BaseModel):
+    """把一个已确认的业务函数参数绑定到标准任务输入或 Artifact 字段。"""
+
+    parameter_name: str = Field(pattern=r"^[a-zA-Z_][a-zA-Z0-9_]{0,127}$")
+    source: Literal["TASK_PAYLOAD", "INPUTS", "ARTIFACT_CONTENT", "ARTIFACT_FIELD"]
+    artifact_type: str | None = None
+    source_pointer: str | None = None
+
+    @model_validator(mode="after")
+    def validate_source(self) -> ScriptFunctionArgument:
+        """字段来源必须完整，整份输入来源不得混入字段定位。"""
+
+        if self.source == "ARTIFACT_FIELD":
+            if not self.artifact_type or not self.source_pointer:
+                raise ValueError("资料字段来源必须指定 Artifact 类型和字段路径")
+            ScriptInputFieldBinding(
+                script_field=self.parameter_name,
+                artifact_type=self.artifact_type,
+                source_pointer=self.source_pointer,
+            )
+        elif self.source == "ARTIFACT_CONTENT":
+            if not self.artifact_type or self.source_pointer is not None:
+                raise ValueError("完整产物内容来源必须指定 Artifact 类型且不能指定字段路径")
+        elif self.artifact_type is not None or self.source_pointer is not None:
+            raise ValueError("整份输入来源不能同时指定资料字段")
+        return self
+
+
+class ScriptNestedFieldBinding(BaseModel):
+    """把已注册列表或列表记录字段映射为脚本读取的别名。"""
+
+    parameter_name: str = Field(pattern=r"^[a-zA-Z_][a-zA-Z0-9_]{0,127}$")
+    artifact_type: str = Field(min_length=1)
+    source_pointer: str = Field(min_length=1)
+    target_pointer: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_paths(self) -> ScriptNestedFieldBinding:
+        """仅允许单层列表改名及其逐项字段别名，不补造值或重排记录。"""
+
+        source = self.source_pointer.strip("/").split("/")
+        target = self.target_pointer.strip("/").split("/")
+        collection_alias = len(source) == len(target) == 1
+        record_alias = len(source) == len(target) == 3 and source[1] == target[1] == "*"
+        if (
+            not (collection_alias or record_alias)
+            or any(not part or part in {".", ".."} for part in (*source, *target))
+            or source == target
+        ):
+            raise ValueError("字段映射仅支持单层列表或列表记录字段别名")
+        return self
+
+
+class ScriptFunctionAdapter(BaseModel):
+    """固定用户确认的函数及参数含义，供生成不可变的标准入口。"""
+
+    function_name: str = Field(pattern=r"^[a-zA-Z_][a-zA-Z0-9_]{0,127}$")
+    arguments: list[ScriptFunctionArgument] = Field(min_length=1, max_length=6)
+    field_bindings: list[ScriptNestedFieldBinding] = Field(default_factory=list, max_length=32)
+
+    @model_validator(mode="after")
+    def validate_arguments(self) -> ScriptFunctionAdapter:
+        """一个函数参数只能绑定一次。"""
+
+        names = [item.parameter_name for item in self.arguments]
+        if len(names) != len(set(names)):
+            raise ValueError("函数参数不能重复绑定")
+        arguments = {item.parameter_name: item for item in self.arguments}
+        targets = [(item.parameter_name, item.target_pointer) for item in self.field_bindings]
+        if len(targets) != len(set(targets)):
+            raise ValueError("同一脚本字段不能重复映射")
+        if any(
+            item.parameter_name not in arguments
+            or arguments[item.parameter_name].source != "ARTIFACT_CONTENT"
+            or arguments[item.parameter_name].artifact_type != item.artifact_type
+            for item in self.field_bindings
+        ):
+            raise ValueError("嵌套字段映射需要同一参数接收完整上游产物内容")
+        collection_aliases = {
+            (item.parameter_name, item.source_pointer, item.target_pointer)
+            for item in self.field_bindings
+            if "*" not in item.source_pointer
+        }
+        for item in self.field_bindings:
+            if "*" not in item.source_pointer:
+                continue
+            source_collection = "/" + item.source_pointer.strip("/").split("/")[0]
+            target_collection = "/" + item.target_pointer.strip("/").split("/")[0]
+            if (
+                source_collection != target_collection
+                and (item.parameter_name, source_collection, target_collection)
+                not in collection_aliases
+            ):
+                raise ValueError("跨列表字段映射必须先确认整个列表的来源")
+        return self
+
+
+def project_script_input_fields(
+    inputs: list[dict[str, object]], bindings: list[ScriptInputFieldBinding]
+) -> dict[str, Any]:
+    """按人工确认的映射生成脚本参数；缺失或多义输入立即报错。
+
+    参数 inputs 是已通过 Artifact Schema 的正式内容，bindings 来自不可变 Skill
+    修订；返回值可直接放入 run(inputs, parameters) 的 parameters.input_fields。
+    """
+    result: dict[str, Any] = {}
+    for binding in bindings:
+        matching = [item for item in inputs if item.get("artifact_type") == binding.artifact_type]
+        if not matching and not binding.required:
+            continue
+        if len(matching) != 1:
+            raise ValueError(
+                f"脚本字段 {binding.script_field} 需要唯一的 {binding.artifact_type} 输入，"
+                f"实际得到 {len(matching)} 个"
+            )
+        current: Any = matching[0].get("content")
+        try:
+            for encoded in binding.source_pointer.lstrip("/").split("/"):
+                token = encoded.replace("~1", "/").replace("~0", "~")
+                if isinstance(current, dict):
+                    current = current[token]
+                elif isinstance(current, list) and token.isdecimal():
+                    current = current[int(token)]
+                else:
+                    raise KeyError(token)
+        except (KeyError, IndexError, TypeError) as exc:
+            if binding.required:
+                raise ValueError(
+                    f"脚本字段 {binding.script_field} 的来源 "
+                    f"{binding.artifact_type}{binding.source_pointer} 不存在"
+                ) from exc
+            continue
+        if binding.script_field in result:
+            raise ValueError(f"脚本字段重复映射：{binding.script_field}")
+        result[binding.script_field] = current
+    return result
+
+
+class ScriptSourceFieldOption(BaseModel):
+    """向用户展示一个来自现有受控输入契约的可选字段。"""
+
+    artifact_type: str
+    source_pointer: str
+    business_label: str
+
+
+class ScriptInputMappingProposal(BaseModel):
+    """返回模型建议和代码验证后的待确认字段映射，不直接发布。"""
+
+    detected_fields: list[str] = Field(default_factory=list)
+    source_fields: list[ScriptSourceFieldOption] = Field(default_factory=list)
+    suggested_bindings: list[ScriptInputFieldBinding] = Field(default_factory=list)
+    unresolved_fields: list[str] = Field(default_factory=list)
+    reason: str = ""
+
+
+class ScriptMappingSelection(BaseModel):
+    """约束模型只能对已检测的脚本字段提出已有来源候选。"""
+
+    suggested_bindings: list[ScriptInputFieldBinding] = Field(default_factory=list)
+    reason: str = ""
+
+
+_FIELD_LABELS = {
+    "segments": "文档段落",
+    "entities": "实体列表",
+    "relations": "关系列表",
+    "properties": "属性列表",
+    "rows": "表格数据行",
+    "columns": "表格列名",
+    "sections": "报告章节",
+    "evidence": "证据列表",
+    "summary": "内容摘要",
+    "title": "标题",
+    "name": "名称",
+}
+
+
+def detect_script_input_fields(source: bytes) -> list[str]:
+    """静态识别脚本从 parameters.input_fields 读取的字段名，不执行脚本。"""
+
+    import ast
+
+    tree = ast.parse(source.decode("utf-8"))
+    aliases = {"input_fields"}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        value = node.value
+        is_binding = (
+            isinstance(value, ast.Subscript)
+            and isinstance(value.slice, ast.Constant)
+            and value.slice.value == "input_fields"
+        )
+        is_get = (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Attribute)
+            and value.func.attr == "get"
+            and value.args
+            and isinstance(value.args[0], ast.Constant)
+            and value.args[0].value == "input_fields"
+        )
+        if is_binding or is_get:
+            aliases.update(target.id for target in node.targets if isinstance(target, ast.Name))
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant):
+            if isinstance(node.slice.value, str) and _is_input_fields_expr(node.value, aliases):
+                found.add(node.slice.value)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if (
+                node.func.attr == "get"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+                and _is_input_fields_expr(node.func.value, aliases)
+            ):
+                found.add(node.args[0].value)
+    return sorted(found)
+
+
+def _is_input_fields_expr(value: Any, aliases: set[str]) -> bool:
+    """判断 AST 表达式是否引用平台受控的 input_fields 字典。"""
+
+    import ast
+
+    if isinstance(value, ast.Name):
+        return value.id in aliases
+    if isinstance(value, ast.Subscript):
+        return (
+            isinstance(value.slice, ast.Constant)
+            and value.slice.value == "input_fields"
+            and isinstance(value.value, ast.Name)
+            and value.value.id == "parameters"
+        )
+    if isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute):
+        return (
+            value.func.attr == "get"
+            and isinstance(value.func.value, ast.Name)
+            and value.func.value.id == "parameters"
+            and bool(value.args)
+            and isinstance(value.args[0], ast.Constant)
+            and value.args[0].value == "input_fields"
+        )
+    return False
+
+
+def list_script_source_fields(
+    artifact_registry: Any, input_artifact_types: list[str]
+) -> list[ScriptSourceFieldOption]:
+    """从注册 Schema 列出顶层字段候选，避免模型虚构不存在的来源路径。"""
+
+    options: list[ScriptSourceFieldOption] = []
+    for artifact_type in input_artifact_types:
+        model = artifact_registry.require(artifact_type).content_model
+        if model is None:
+            continue
+        for field_name in model.model_fields:
+            if field_name in {"schema_version", "metadata"}:
+                continue
+            options.append(
+                ScriptSourceFieldOption(
+                    artifact_type=artifact_type,
+                    source_pointer=f"/{field_name}",
+                    business_label=_FIELD_LABELS.get(field_name, f"资料中的{field_name}"),
+                )
+            )
+    return options
+
+
+class ScriptOutputFieldBinding(BaseModel):
+    """把脚本原始结果字段显式写入一个既有 Artifact 标准顶层字段。"""
+
+    artifact_type: str = Field(min_length=1)
+    source_pointer: str = Field(min_length=1)
+    target_field: str = Field(pattern=r"^[a-zA-Z_][a-zA-Z0-9_]{0,127}$")
+    record_field_bindings: dict[str, str] = Field(default_factory=dict, max_length=32)
+
+    @field_validator("source_pointer")
+    @classmethod
+    def validate_source_pointer(cls, value: str) -> str:
+        """要求原始结果字段使用绝对 JSON Pointer。"""
+
+        if not value.startswith("/") or value == "/":
+            raise ValueError("脚本输出来源必须是 JSON Pointer")
+        return value
+
+
+def read_json_pointer(content: object, pointer: str) -> Any:
+    """从已确认的 JSON Pointer 读取对象字段，缺失时抛出确定性错误。"""
+
+    current: Any = content
+    for encoded in pointer.lstrip("/").split("/"):
+        token = encoded.replace("~1", "/").replace("~0", "~")
+        if isinstance(current, dict):
+            current = current[token]
+        elif isinstance(current, list) and token.isdecimal():
+            current = current[int(token)]
+        else:
+            raise KeyError(token)
+    return current
+
+
+class ScriptOutputTargetOption(BaseModel):
+    """向业务界面展示一个既有标准 Artifact 字段。"""
+
+    artifact_type: str
+    target_field: str
+    business_label: str
+
+
+class ScriptOutputMappingProposal(BaseModel):
+    """返回沙箱试运行观测到的脚本字段及可选标准目标，不自动确认。"""
+
+    observed_fields: list[str] = Field(default_factory=list)
+    target_fields: list[ScriptOutputTargetOption] = Field(default_factory=list)
+    suggested_bindings: list[ScriptOutputFieldBinding] = Field(default_factory=list)
+    observed_record_fields: dict[str, list[str]] = Field(default_factory=dict)
+    target_record_fields: dict[str, list[str]] = Field(default_factory=dict)
+
+
+class ScriptOutputMappingSelection(BaseModel):
+    """限制模型只提出用户仍需确认的输出字段候选，不保存或执行建议。"""
+
+    suggested_bindings: list[ScriptOutputFieldBinding] = Field(default_factory=list)
+    reason: str = ""
+
+
+def list_script_output_targets(
+    artifact_registry: Any, output_artifact_type: str
+) -> list[ScriptOutputTargetOption]:
+    """从已注册输出 Schema 列出可映射顶层字段，不允许用户创造契约。"""
+
+    model = artifact_registry.require(output_artifact_type).content_model
+    if model is None:
+        return []
+    return [
+        ScriptOutputTargetOption(
+            artifact_type=output_artifact_type,
+            target_field=field_name,
+            business_label=_FIELD_LABELS.get(field_name, f"结果中的{field_name}"),
+        )
+        for field_name in model.model_fields
+        if field_name != "schema_version"
+    ]
+
+
+def list_nested_source_fields(
+    artifact_registry: Any, input_artifact_types: list[str]
+) -> list[ScriptSourceFieldOption]:
+    """从注册的 Pydantic 内容模型列出列表记录字段，不让模型虚构来源。"""
+
+    from typing import get_args, get_origin
+
+    options: list[ScriptSourceFieldOption] = []
+
+    def visit(artifact_type: str, model: type[BaseModel], path: str, depth: int) -> None:
+        """递归展开有限层模型字段；只收集可逐项读取的列表记录字段。"""
+
+        if depth > 4 or len(options) >= 128:
+            return
+        for name, field in model.model_fields.items():
+            if name in {"schema_version", "metadata"}:
+                continue
+            annotation = field.annotation
+            pointer = f"{path}/{name}"
+            origin = get_origin(annotation)
+            if origin is list:
+                item_type = get_args(annotation)[0]
+                if isinstance(item_type, type) and issubclass(item_type, BaseModel):
+                    visit(artifact_type, item_type, f"{pointer}/*", depth + 1)
+                elif "*" in path:
+                    options.append(
+                        ScriptSourceFieldOption(
+                            artifact_type=artifact_type,
+                            source_pointer=pointer,
+                            business_label=f"{artifact_type} 中的 {pointer}",
+                        )
+                    )
+            elif isinstance(annotation, type) and issubclass(annotation, BaseModel):
+                visit(artifact_type, annotation, pointer, depth + 1)
+            elif "*" in path:
+                options.append(
+                    ScriptSourceFieldOption(
+                        artifact_type=artifact_type,
+                        source_pointer=pointer,
+                        business_label=f"{artifact_type} 中的 {pointer}",
+                    )
+                )
+
+    for artifact_type in input_artifact_types:
+        model = artifact_registry.require(artifact_type).content_model
+        if model is not None:
+            visit(artifact_type, model, "", 0)
+    return options
+
+
+def recommend_nested_field_bindings(
+    parameter_name: str,
+    artifact_type: str,
+    script_paths: list[str],
+    options: list[ScriptSourceFieldOption],
+) -> tuple[list[ScriptNestedFieldBinding], list[str]]:
+    """只推荐同层且唯一的字段别名；多义或缺失保持未解决。"""
+
+    available = {
+        option.source_pointer for option in options if option.artifact_type == artifact_type
+    }
+    suggested: list[ScriptNestedFieldBinding] = []
+    unresolved: list[str] = []
+    for target in script_paths:
+        if "*" not in target or target in available:
+            continue
+        parent, target_name = target.rsplit("/", 1)
+        candidates = [path for path in available if path.rsplit("/", 1)[0] == parent]
+        exact_suffix = [
+            path
+            for path in candidates
+            if path.rsplit("/", 1)[1].lower().endswith(f"_{target_name.lower()}")
+        ]
+        if target_name.lower() == "id" and len(exact_suffix) > 1:
+            collection = parent.split("/")[-2].lower()
+            singular = (
+                collection[:-3] + "y" if collection.endswith("ies") else collection.rstrip("s")
+            )
+            preferred = [path for path in exact_suffix if path.endswith(f"/{singular}_id")]
+            exact_suffix = preferred if len(preferred) == 1 else exact_suffix
+        semantic_aliases = {
+            "type": {"class_id", "class", "category", "kind"},
+            "identifier": {"entity_id", "record_id", "item_id"},
+        }
+        semantic = [
+            path
+            for path in candidates
+            if path.rsplit("/", 1)[1].lower() in semantic_aliases.get(target_name.lower(), set())
+        ]
+        matches = exact_suffix or semantic
+        if len(matches) == 1:
+            suggested.append(
+                ScriptNestedFieldBinding(
+                    parameter_name=parameter_name,
+                    artifact_type=artifact_type,
+                    source_pointer=matches[0],
+                    target_pointer=target,
+                )
+            )
+        else:
+            unresolved.append(target)
+    return suggested, unresolved
+
+
+def recommend_function_field_bindings(
+    parameter_name: str,
+    artifact_type: str,
+    script_paths: list[str],
+    nested_options: list[ScriptSourceFieldOption],
+) -> tuple[list[ScriptNestedFieldBinding], list[str]]:
+    """从唯一上游列表推荐列表别名及同名单项字段，保留歧义供人工判断。"""
+
+    available = {
+        item.source_pointer for item in nested_options if item.artifact_type == artifact_type
+    }
+    collections = {"/" + path.strip("/").split("/")[0] for path in available}
+    targets = {"/" + path.strip("/").split("/")[0] for path in script_paths if "*" in path}
+    suggested: list[ScriptNestedFieldBinding] = []
+    unresolved: list[str] = []
+    collection_sources: dict[str, str] = {}
+    for target in sorted(targets):
+        if target in collections:
+            collection_sources[target] = target
+        elif len(collections) == 1:
+            source = next(iter(collections))
+            collection_sources[target] = source
+            suggested.append(
+                ScriptNestedFieldBinding(
+                    parameter_name=parameter_name,
+                    artifact_type=artifact_type,
+                    source_pointer=source,
+                    target_pointer=target,
+                )
+            )
+        else:
+            unresolved.append(target)
+    for target in sorted(path for path in script_paths if "*" in path):
+        target_parts = target.strip("/").split("/")
+        if len(target_parts) != 3:
+            unresolved.append(target)
+            continue
+        source_collection = collection_sources.get("/" + target_parts[0])
+        if source_collection is None:
+            unresolved.append(target)
+            continue
+        source_parent = source_collection + "/*/"
+        matches = [
+            path
+            for path in available
+            if path.startswith(source_parent)
+            and path.count("/") == 3
+            and path.rsplit("/", 1)[-1] == target_parts[-1]
+        ]
+        if not matches:
+            # 候选只在同一个上游列表内寻找；通用角色别名不是执行期猜测，
+            # 保存前仍由用户确认，并由契约试运行验证真实结构。
+            source_records = [
+                path
+                for path in available
+                if path.startswith(source_parent) and path.count("/") == 3
+            ]
+            target_name = target_parts[-1].lower()
+            source_collection_name = source_collection.strip("/").split("/")[-1].lower()
+            singular = (
+                source_collection_name[:-3] + "y"
+                if source_collection_name.endswith("ies")
+                else source_collection_name.rstrip("s")
+            )
+            if target_name in {"name", "label"}:
+                matches = [
+                    path
+                    for path in source_records
+                    if path.rsplit("/", 1)[-1].lower()
+                    in ({"name", "label"} - {target_name})
+                ]
+            elif target_name in {"id", "identifier"}:
+                matches = [
+                    path
+                    for path in source_records
+                    if path.rsplit("/", 1)[-1].lower() == f"{singular}_id"
+                ]
+                if not matches:
+                    matches = [
+                        path
+                        for path in source_records
+                        if path.rsplit("/", 1)[-1].lower() in {"id", "identifier"}
+                    ]
+        if len(matches) == 1:
+            if matches[0] != target:
+                suggested.append(
+                    ScriptNestedFieldBinding(
+                        parameter_name=parameter_name,
+                        artifact_type=artifact_type,
+                        source_pointer=matches[0],
+                        target_pointer=target,
+                    )
+                )
+        else:
+            unresolved.append(target)
+    return suggested, unresolved
+
+
+def recommend_script_output_mapping(
+    artifact_type: str,
+    observed_fields: list[str],
+    observed_shapes: dict[str, str],
+    targets: list[ScriptOutputTargetOption],
+    nested_options: list[ScriptSourceFieldOption],
+) -> ScriptOutputMappingProposal:
+    """依据实际试运行形状和标准 Schema 推荐顶层及列表记录字段映射。"""
+
+    import re
+
+    observed_records: dict[str, list[str]] = {}
+    for name, shape in observed_shapes.items():
+        match = re.search(r"单项字段：(.+)$", shape)
+        if match:
+            observed_records[name] = [part.strip() for part in match.group(1).split(",")][:12]
+    target_records: dict[str, list[str]] = {}
+    for target in targets:
+        prefix = f"/{target.target_field}/*/"
+        target_records[target.target_field] = sorted(
+            {
+                item.source_pointer[len(prefix) :]
+                for item in nested_options
+                if item.artifact_type == artifact_type
+                and item.source_pointer.startswith(prefix)
+                and "/" not in item.source_pointer[len(prefix) :]
+            }
+        )
+
+    def choose(target_name: str, candidates: list[str]) -> str | None:
+        """仅在候选唯一时给出可人工确认的命名建议。"""
+
+        if target_name in candidates:
+            return target_name
+        normalized = [
+            name
+            for name in candidates
+            if any(
+                name == prefix + target_name
+                for prefix in ("normalized_", "processed_", "updated_", "canonical_", "merged_")
+            )
+        ]
+        if target_name == "class_id" and "type" in candidates:
+            normalized.append("type")
+        if target_name == "entity_id":
+            normalized.extend(name for name in candidates if name == "canonical_id")
+        unique = set(normalized)
+        return next(iter(unique)) if len(unique) == 1 else None
+
+    suggestions: list[ScriptOutputFieldBinding] = []
+    for target in targets:
+        source_name = choose(target.target_field, observed_fields)
+        if source_name is None:
+            continue
+        source_records = observed_records.get(source_name, [])
+        record_bindings = {
+            field: source
+            for field in target_records.get(target.target_field, [])
+            if (source := choose(field, source_records)) is not None
+        }
+        suggestions.append(
+            ScriptOutputFieldBinding(
+                artifact_type=artifact_type,
+                source_pointer=f"/{source_name}",
+                target_field=target.target_field,
+                record_field_bindings=record_bindings,
+            )
+        )
+    return ScriptOutputMappingProposal(
+        observed_fields=observed_fields,
+        target_fields=targets,
+        observed_record_fields=observed_records,
+        target_record_fields=target_records,
+        suggested_bindings=suggestions,
+    )

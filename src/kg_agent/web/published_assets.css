@@ -1,0 +1,31 @@
+/* 已发布资产管理页的视觉样式；不承载任务状态或任何业务判断。 */
+:root { color-scheme: light; font-family: Inter, "Microsoft YaHei", sans-serif; color: #172033; background: #f3f6fb; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+.asset-shell { max-width: 1320px; margin: 0 auto; padding: 36px 24px 60px; }
+.asset-header { display: flex; justify-content: space-between; align-items: start; gap: 20px; }
+h1, h2, p { margin-top: 0; }
+h1 { margin-bottom: 8px; font-size: 30px; }
+h2 { margin-bottom: 0; font-size: 19px; }
+.eyebrow { margin-bottom: 8px; color: #64748b; font-size: 13px; }
+.subtitle { color: #566579; }
+a { color: #2563eb; text-decoration: none; }
+.notice { margin: 24px 0; padding: 12px 14px; border-radius: 9px; color: #1e4d90; background: #e8f1ff; }
+.notice.error { color: #a52d2d; background: #fff0f0; }
+.asset-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
+.asset-panel, .preview-panel { padding: 22px; border: 1px solid #dfe6f1; border-radius: 14px; background: #fff; box-shadow: 0 4px 14px rgba(29, 47, 77, .04); }
+.panel-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 16px; }
+.count { min-width: 28px; padding: 4px 8px; border-radius: 999px; text-align: center; color: #1d4ed8; background: #dbeafe; font-size: 12px; }
+.asset-list { display: grid; gap: 10px; }
+.asset-card { display: grid; gap: 8px; padding: 14px; border: 1px solid #e5eaf2; border-radius: 10px; }
+.asset-card strong { font-size: 15px; }
+.meta { color: #64748b; font-size: 12px; }
+.asset-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+button { width: fit-content; border: 0; border-radius: 7px; padding: 8px 12px; cursor: pointer; color: #fff; background: #2563eb; font: inherit; }
+button.secondary { color: #334155; background: #e9eef6; }
+button.danger { color: #b42318; background: #fff0ef; }
+.empty { margin: 0; color: #64748b; }
+.preview-panel { margin-top: 20px; }
+.asset-json { max-height: 540px; overflow: auto; margin: 0; padding: 14px; border-radius: 9px; color: #dbeafe; background: #111827; white-space: pre-wrap; overflow-wrap: anywhere; }
+.graph-container { min-height: 520px; }
+@media (max-width: 850px) { .asset-grid { grid-template-columns: 1fr; } .asset-header { flex-direction: column; } }

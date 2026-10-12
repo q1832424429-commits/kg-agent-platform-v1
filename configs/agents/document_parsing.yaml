@@ -1,0 +1,19 @@
+agent_type: document_parsing_agent
+name: 数据源解析 Agent
+version: 1.0.0
+description: 负责识别并解析原始文档，形成文档清单、解析文档和语义文档。
+accepted_subtask_types:
+  - document_parse
+accepted_input_types:
+  - RawDocument
+produced_output_types:
+  - DocumentManifest
+  - ParsedDocument
+  - SemanticDocument
+allowed_skills:
+  - parse_document
+  - build_document_manifest
+can_publish_subtasks: false
+can_publish_ontology: false
+can_publish_graph: false
+lifecycle: ACTIVE

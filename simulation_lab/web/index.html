@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <!-- 人工观察台完全本地运行，不加载第三方脚本、字体或远程素材。 -->
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="知识图谱 Agent 路由与可切换 Skill 执行日志观察台" />
+    <title>Agent 人工观察台</title>
+    <!-- 版本参数用于让浏览器在前端修复发布后立即获取新资源，避免旧缓存误报服务状态。 -->
+    <link rel="stylesheet" href="/assets/app.css?v=20260921-1" />
+    <link rel="stylesheet" href="/workbench-assets/extension_dialogs.css?v=20260924-2" />
+  </head>
+  <body>
+    <!-- 顶栏明确提示隔离与人工判断，防止把实验日志当成生产结论。 -->
+    <header class="topbar">
+      <div class="lab-mark">LAB</div>
+      <div class="brand-copy">
+        <strong>Agent 人工观察台</strong>
+        <span>真实 Agent · 真实输入 · 人工判断</span>
+      </div>
+      <div class="topbar-spacer"></div>
+      <span class="isolation-pill">真实输入 · 独立数据</span>
+      <span id="health-status" class="health-pill">正在连接</span>
+      <!-- 资产目录仅展示真正发布的本体和图谱，任务内导入副本不会出现于此。 -->
+      <a class="extension-open-button" href="/published-assets">已发布资产</a>
+      <!-- 一个入口先选择创建类型，再显示对应的受控定义表单。 -->
+      <button id="open-extension-button" class="extension-open-button" type="button">自定义能力</button>
+      <a class="workbench-link" href="http://127.0.0.1:8000/workbench">返回正式工作台 ↗</a>
+    </header>
+
+    <main class="lab-shell">
+      <!-- 普通文档和本体均只接受用户真实上传。 -->
+      <aside class="test-panel">
+        <div class="panel-heading">
+          <span class="step-number">01</span>
+          <div><strong>测试用户输入</strong><small>上传真实文件，或提交纯文本任务</small></div>
+        </div>
+        <form id="simulation-form">
+          <label for="question">用户问题</label>
+          <textarea id="question" rows="8" required>解析已有的制造业设备文档，抽取设备实体并形成实体数据集。</textarea>
+
+          <label for="document-input">业务文档（可选）</label>
+          <label class="file-drop" for="document-input">
+            <span aria-hidden="true">◇</span>
+            <strong id="document-file-label">选择一个或多个真实文件</strong>
+            <small>PDF、DOCX、XLSX、PPTX、JPEG、PNG、TIFF、WebP</small>
+          </label>
+          <input
+            id="document-input"
+            type="file"
+            accept=".pdf,.docx,.xlsx,.pptx,.jpg,.jpeg,.png,.tif,.tiff,.webp"
+            multiple
+            hidden
+          />
+          <div id="document-file-list" class="file-list"></div>
+
+          <label for="ontology-input">外部本体模型（可选）</label>
+          <label class="file-drop ontology-drop" for="ontology-input">
+            <span aria-hidden="true">◇</span>
+            <strong id="ontology-file-label">选择本体 JSON</strong>
+            <small>上传后按外部本体审核流程处理</small>
+          </label>
+          <input id="ontology-input" type="file" accept=".json,application/json" hidden />
+
+          <label for="published-ontology-select">复用测试端已发布本体</label>
+          <select id="published-ontology-select"><option value="">不选择</option></select>
+          <label for="published-graph-select">复用测试端已发布图谱作为增量基线</label>
+          <select id="published-graph-select"><option value="">不选择</option></select>
+          <button id="refresh-assets-button" class="secondary-button" type="button">刷新已发布资产</button>
+
+          <p class="field-note">所有业务 Skill 使用 LLM 或正式确定性处理；不提供 Mock 模式。</p>
+
+          <div class="mode-row">
+            <span id="run-mode">新实验任务</span>
+            <button id="reset-button" type="button">清空上下文</button>
+          </div>
+          <button id="run-button" class="run-button" type="submit">
+            <span>运行并输出日志</span><span aria-hidden="true">→</span>
+          </button>
+        </form>
+
+        <div class="manual-note">
+          <strong>由你人工检查</strong>
+          <p>系统只展示公开结构化结果，不输出 PASS/FAIL，也不展示模型隐藏思维过程。</p>
+        </div>
+      </aside>
+
+      <!-- 中间区域按服务端 sequence 重放完整公开执行日志。 -->
+      <section class="execution-panel">
+        <div class="progress-card">
+          <div class="progress-ring" id="progress-ring" style="--progress: 0">
+            <div><strong id="progress-value">0%</strong><span>任务进度</span></div>
+          </div>
+          <div class="progress-copy">
+            <span class="eyebrow">当前阶段</span>
+            <h1 id="progress-stage">等待真实输入</h1>
+            <p id="progress-detail">运行后将按顺序输出意图、拆解、分配、认领、Agent、Skills 和 Artifacts。</p>
+          </div>
+        </div>
+
+        <!-- 总控只生成候选计划；用户批准后才发布子任务并创建 Assignment。 -->
+        <section id="plan-review-panel" class="plan-review-panel" hidden></section>
+
+        <div class="pipeline-heading">
+          <div><span class="step-number">02</span><strong>顺序执行日志</strong></div>
+          <span id="log-count" class="overall-badge is-idle">0 条</span>
+        </div>
+        <div id="log-stream" class="log-stream">
+          <div class="empty-state"><span>⌁</span><strong>等待运行</strong><p>日志将严格按照公开业务事件顺序编号。</p></div>
+        </div>
+      </section>
+
+      <!-- 右侧把相同日志按人工检查关注点重新组织，不给出正确性结论。 -->
+      <aside class="evidence-panel">
+        <div class="panel-heading">
+          <span class="step-number">03</span>
+          <div><strong>结构化输出</strong><small>选择你要检查的内容</small></div>
+        </div>
+        <nav class="tabs">
+          <button class="tab is-active" data-tab="intent" type="button">意图</button>
+          <button class="tab" data-tab="route" type="button">子任务</button>
+          <button class="tab" data-tab="skills" type="button">Skills</button>
+          <button class="tab" data-tab="artifacts" type="button">产物</button>
+          <button class="tab" data-tab="reviews" type="button">审核</button>
+          <button class="tab" data-tab="timings" type="button">耗时</button>
+          <button class="tab" data-tab="raw" type="button">原始</button>
+        </nav>
+        <div id="evidence-content" class="evidence-content">
+          <div class="empty-state"><span>◎</span><strong>暂无输出</strong><p>完成运行后可分别查看总控意图、子任务与 Skill 调用顺序。</p></div>
+        </div>
+      </aside>
+    </main>
+
+    <!-- 测试端审核只写入隔离数据库；候选本体修改使用正式 ChangeSet 契约。 -->
+    <dialog id="review-dialog" class="review-dialog">
+      <form method="dialog">
+        <div class="dialog-heading">
+          <div><span class="eyebrow">HUMAN REVIEW</span><h2>预览并确认候选本体</h2></div>
+          <button class="dialog-close" value="cancel" aria-label="关闭">×</button>
+        </div>
+        <div id="review-materials"></div>
+        <label id="review-title-label" for="review-title">发布名称（批准时必填）</label>
+        <input id="review-title" maxlength="120" placeholder="例如：汽车制造设备故障图谱 V1" />
+        <label id="review-feedback-label" for="review-feedback">审核说明</label>
+        <textarea id="review-feedback" rows="3" placeholder="拒绝时必须填写；批准时可选。"></textarea>
+        <label id="review-operations-label" for="review-operations">修改操作（JSON 数组）</label>
+        <textarea id="review-operations" class="raw-output review-editor" rows="8">[]</textarea>
+        <div id="review-actions" class="dialog-actions">
+          <button id="reject-review-button" class="danger-button" type="button">拒绝</button>
+          <button id="changes-review-button" class="secondary-button" type="button">提交修改</button>
+          <button id="approve-review-button" class="run-button compact-button" type="button">批准当前版本</button>
+        </div>
+      </form>
+    </dialog>
+
+    <!-- 意图与子任务计划审核使用独立弹窗；修改意见必须交回总控重新生成正式计划。 -->
+    <dialog id="plan-review-dialog" class="review-dialog plan-review-dialog">
+      <form method="dialog">
+        <div class="dialog-heading">
+          <div><span class="eyebrow">AGENT PLAN REVIEW</span><h2>审核后发布意图与子任务</h2></div>
+          <button class="dialog-close" value="cancel" aria-label="关闭">×</button>
+        </div>
+        <div id="plan-review-materials"></div>
+        <label for="plan-review-feedback">修改意见</label>
+        <textarea
+          id="plan-review-feedback"
+          rows="5"
+          placeholder="例如：只抽取实体，不要构建或发布图谱；或者删除某个不需要的子任务。"
+        ></textarea>
+        <p class="field-note">提交修改后，总控 Agent 会根据你的意见重新识别并拆解；新计划仍需再次审核。</p>
+        <div class="dialog-actions">
+          <button id="revise-plan-button" class="secondary-button" type="button">提交修改并重新规划</button>
+          <button id="approve-plan-button" class="run-button compact-button" type="button">批准并开始执行</button>
+        </div>
+      </form>
+    </dialog>
+
+    <!-- Skill 定义在测试端直接创建并发布；不跳转到独立页面，也不写入正式端数据库。 -->
+    <dialog id="custom-skill-dialog" class="review-dialog extension-dialog">
+      <form id="custom-skill-form">
+        <div class="dialog-heading">
+          <div><span class="eyebrow">CUSTOM SKILL</span><h2>新建自定义 Skill</h2></div>
+          <button class="dialog-close" type="button" data-close-extension-dialog aria-label="关闭">×</button>
+        </div>
+        <p class="field-note">创建后立即发布，仅在测试端后续新任务中被发现。当前仅支持 LLM Skill；资源只保存、不执行。</p>
+        <div class="extension-field-grid">
+          <label>Skill 标识<input name="skill_key" required pattern="[a-z][a-z0-9_]{2,127}" placeholder="summarize_equipment" /></label>
+          <label>显示名称<input name="name" required placeholder="设备摘要 Skill" /></label>
+        </div>
+        <label>功能描述<textarea name="description" rows="2" required placeholder="说明它解决什么问题。"></textarea></label>
+        <label>支持的子任务类型（逗号分隔）<input name="supported_subtask_types" required placeholder="equipment_summarize" /></label>
+        <div class="extension-field-grid">
+          <label>输入产物类型（逗号分隔）<input name="input_artifact_types" placeholder="SemanticDocument" /></label>
+          <label>输出产物类型（逗号分隔）<input name="output_artifact_types" required placeholder="EntityDataset" /></label>
+        </div>
+        <label>执行说明<textarea name="instruction_markdown" rows="6" required placeholder="说明输入、处理规则、边界、停止条件及输出要求。"></textarea></label>
+        <details class="extension-resource-details">
+          <summary>可选捆绑资源</summary>
+          <label>资源相对路径<input name="resource_path" placeholder="references/domain.md" /></label>
+          <label>资源文件<input name="resource" type="file" /></label>
+        </details>
+        <div class="dialog-actions">
+          <button class="secondary-button" type="button" data-close-extension-dialog>取消</button>
+          <button id="create-custom-skill-button" class="run-button compact-button" type="submit">创建并发布</button>
+        </div>
+      </form>
+    </dialog>
+
+    <!-- Agent 定义拥有独立职责和权限 YAML；允许调用的 Skill 是唯一权限来源。 -->
+    <dialog id="custom-agent-dialog" class="review-dialog extension-dialog">
+      <form id="custom-agent-form">
+        <div class="dialog-heading">
+          <div><span class="eyebrow">CUSTOM AGENT</span><h2>新建自定义 Agent</h2></div>
+          <button class="dialog-close" type="button" data-close-extension-dialog aria-label="关闭">×</button>
+        </div>
+        <p class="field-note">请先创建并发布它需要的自定义 Skill。发布后，测试端下一轮任务才会发现此 Agent。</p>
+        <div class="extension-field-grid">
+          <label>Agent 标识<input name="agent_key" required pattern="[a-z][a-z0-9_]{2,127}" placeholder="equipment_analysis_agent" /></label>
+          <label>显示名称<input name="name" required placeholder="设备分析 Agent" /></label>
+        </div>
+        <label>职责描述<textarea name="description" rows="2" required placeholder="说明它应负责的专业任务。"></textarea></label>
+        <label>接受的子任务类型（逗号分隔）<input name="accepted_subtask_types" required placeholder="equipment_summarize" /></label>
+        <div class="extension-field-grid">
+          <label>接受输入产物类型（逗号分隔）<input name="accepted_input_types" placeholder="SemanticDocument" /></label>
+          <label>输出产物类型（逗号分隔）<input name="produced_output_types" placeholder="EntityDataset" /></label>
+        </div>
+        <label>职责说明<textarea name="instruction_markdown" rows="6" required placeholder="说明领域职责、边界和选择 Skill 的原则。"></textarea></label>
+        <label>允许调用的 Skill（逗号分隔）<input name="allowed_skill_names" required placeholder="summarize_equipment" /></label>
+        <div class="dialog-actions">
+          <button class="secondary-button" type="button" data-close-extension-dialog>取消</button>
+          <button id="create-custom-agent-button" class="run-button compact-button" type="submit">创建并发布</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+    <!-- 固定版本的 G6 由正式端源码目录本地托管，测试端不依赖远程 CDN。 -->
+    <script src="/shared-assets/vendor/g6-5.1.1.min.js?v=20260921-1" defer></script>
+    <!-- 复用正式端的交互式图谱组件，不引入第二套前端应用。 -->
+    <script src="/shared-assets/graph_view.js?v=20260921-1" defer></script>
+    <script src="/assets/app.js?v=20260923-1" defer></script>
+    <script src="/workbench-assets/extension_dialogs.js?v=20260924-2" defer></script>
+  </body>
+</html>

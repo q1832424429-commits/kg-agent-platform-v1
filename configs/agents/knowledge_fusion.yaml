@@ -1,0 +1,33 @@
+agent_type: knowledge_fusion_agent
+name: 知识融合 Agent
+version: 1.0.0
+description: 负责本体对齐融合、实体对齐、关系标准化和冲突分析。
+accepted_subtask_types:
+  - ontology_align
+  - ontology_fuse
+  - entity_align
+  - relation_normalize
+  - conflict_analyze
+accepted_input_types:
+  - CandidateOntology
+  - ExternalOntology
+  - PublishedOntology
+  - EntityDataset
+  - RelationDataset
+  - PropertyDataset
+  - EvidenceDataset
+produced_output_types:
+  - FusedCandidateOntology
+  - EntityDataset
+  - RelationDataset
+  - ConflictReport
+allowed_skills:
+  - align_ontology
+  - fuse_ontology
+  - align_entities
+  - normalize_relations
+  - analyze_conflicts
+can_publish_subtasks: false
+can_publish_ontology: false
+can_publish_graph: false
+lifecycle: ACTIVE

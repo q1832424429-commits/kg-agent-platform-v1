@@ -1,0 +1,176 @@
+services:
+  # PostgreSQL 保存任务事实、上下文快照、审核、短期记忆、Mem0 引用和公开轨迹。
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: kg_agent
+      POSTGRES_USER: kg_agent
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-kg_agent}
+    volumes: [postgres_data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kg_agent -d kg_agent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+  # MinIO 保存原始文件和大型 Artifact 内容。
+  minio:
+    image: minio/minio:RELEASE.2025-07-23T15-54-02Z
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-kg_agent_minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-kg_agent_minio_secret}
+    volumes: [minio_data:/data]
+    ports: ["9001:9001"]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+  # 一次性迁移服务确保 API 启动前数据库已经达到最新 revision。
+  migrate:
+    build: .
+    command: alembic upgrade head
+    env_file: [.env]
+    environment: &app_environment
+      PYTHONPATH: /app/src
+      # 出站代理只注入应用进程；PostgreSQL/MinIO 容器不会继承该设置。
+      HTTP_PROXY: ${OUTBOUND_HTTP_PROXY:-}
+      HTTPS_PROXY: ${OUTBOUND_HTTPS_PROXY:-}
+      NO_PROXY: ${OUTBOUND_NO_PROXY:-localhost,127.0.0.1,postgres,minio,simulation-db}
+      DATABASE_URL: postgresql+asyncpg://kg_agent:${POSTGRES_PASSWORD:-kg_agent}@postgres:5432/kg_agent
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-kg_agent_minio}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-kg_agent_minio_secret}
+      MINIO_BUCKET: ${MINIO_BUCKET:-kg-agent-artifacts}
+      MINIO_SECURE: "false"
+      RUN_LOG_DIR: /app/logs
+      SCRIPT_RUNNER_JOBS_DIR: /script-jobs
+    volumes:
+      # 本地联调始终使用仓库当前迁移脚本，避免旧应用镜像遗漏新增 revision。
+      - ./migrations:/app/migrations:ro
+    depends_on:
+      postgres: {condition: service_healthy}
+    restart: "no"
+  # 正式 FastAPI 只接入和查询任务，不在请求进程中执行专业 Agent。
+  api:
+    build: .
+    env_file: [.env]
+    environment: *app_environment
+    # 本地 Docker 开发时只读挂载源码，前端静态资源和 API 代码修改无需等待镜像重建。
+    # 正式镜像仍由 Dockerfile COPY 固化同一份内容，部署环境可移除此开发挂载。
+    volumes:
+      - ./src:/app/src:ro
+      - ./configs:/app/configs:ro
+      - ./logs/formal:/app/logs
+      - script_jobs:/script-jobs
+    ports: ["8000:8000"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      minio: {condition: service_healthy}
+      script-runner: {condition: service_started}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready')"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+  # 独立 Worker 认领 Assignment，运行专业 Agent 及其 LLM/正式确定性 Skills。
+  worker:
+    build: .
+    command: python -m kg_agent.workers.main
+    env_file: [.env]
+    environment: *app_environment
+    volumes:
+      # 本地 Docker 联调时与 API 读取同一份当前源码和配置，避免已有镜像中的
+      # Worker 代码落后于 API；挂载保持只读，不改变正式镜像的固化部署方式。
+      - ./src:/app/src:ro
+      - ./configs:/app/configs:ro
+      - ./logs/formal:/app/logs
+      - script_jobs:/script-jobs
+    depends_on:
+      api: {condition: service_healthy}
+      script-runner: {condition: service_started}
+    # Worker 没有 HTTP 端口；容器主进程退出即由 restart 策略判定失败。
+    healthcheck:
+      disable: true
+    restart: unless-stopped
+  # 验证实验室使用独立 PostgreSQL 卷；刷新页面和重建测试端进程后仍可恢复任务快照。
+  simulation-db:
+    image: postgres:16-alpine
+    profiles: ["simulation"]
+    environment:
+      POSTGRES_DB: kg_agent_simulation
+      POSTGRES_USER: kg_agent_simulation
+      POSTGRES_PASSWORD: kg_agent_simulation
+    volumes: [simulation_postgres_data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kg_agent_simulation -d kg_agent_simulation"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+  # 实验室复用正式 Agent 代码，但使用独立入口、端口、数据库和 MinIO Bucket。
+  simulation:
+    image: kg-agent-platform-v1-api:latest
+    profiles: ["simulation"]
+    command: uvicorn simulation_lab.app:create_app --factory --host 0.0.0.0 --port 8002
+    env_file: [.env]
+    environment:
+      PYTHONPATH: /app/src:/app
+      HTTP_PROXY: ${OUTBOUND_HTTP_PROXY:-}
+      HTTPS_PROXY: ${OUTBOUND_HTTPS_PROXY:-}
+      NO_PROXY: ${OUTBOUND_NO_PROXY:-localhost,127.0.0.1,postgres,minio,simulation-db}
+      SIMULATION_DATABASE_URL: postgresql+asyncpg://kg_agent_simulation:kg_agent_simulation@simulation-db:5432/kg_agent_simulation
+      SIMULATION_MINIO_ENDPOINT: minio:9000
+      SIMULATION_MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-kg_agent_minio}
+      SIMULATION_MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-kg_agent_minio_secret}
+      SIMULATION_MINIO_BUCKET: ${SIMULATION_MINIO_BUCKET:-kg-agent-simulation-artifacts}
+      SIMULATION_MINIO_SECURE: "false"
+      SIMULATION_RUN_LOG_DIR: /app/logs
+      SCRIPT_RUNNER_JOBS_DIR: /script-jobs
+    volumes:
+      - ./simulation_lab:/app/simulation_lab:ro
+      - ./src:/app/src:ro
+      - ./configs:/app/configs:ro
+      - ./migrations:/app/migrations:ro
+      - ./logs/simulation:/app/logs
+      - script_jobs:/script-jobs
+    ports: ["8002:8002"]
+    depends_on:
+      simulation-db: {condition: service_healthy}
+      minio: {condition: service_healthy}
+      script-runner: {condition: service_started}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+  # 用户脚本只在此无网络容器运行；不注入应用凭证，不挂载 Docker Socket。
+  script-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.script-runner
+      # 构建阶段需要下载固定批准依赖；代理只在构建网络中使用，不进入最终运行环境。
+      args:
+        SCRIPT_RUNNER_BASE_IMAGE: ${SCRIPT_RUNNER_BASE_IMAGE:-python:3.12-slim}
+        HTTP_PROXY: ${OUTBOUND_HTTP_PROXY:-}
+        HTTPS_PROXY: ${OUTBOUND_HTTPS_PROXY:-}
+        NO_PROXY: ${OUTBOUND_NO_PROXY:-localhost,127.0.0.1}
+    network_mode: "none"
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 64
+    mem_limit: 512m
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=16m"]
+    volumes: [script_jobs:/jobs]
+    restart: unless-stopped
+# 具名卷使容器重启后数据库和 Artifact 内容仍然存在。
+volumes:
+  postgres_data:
+  minio_data:
+  simulation_postgres_data:
+  script_jobs:

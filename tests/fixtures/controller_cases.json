@@ -1,0 +1,22 @@
+[
+  {"case_id": "start_full_graph", "expected_intent": "START", "expected_agent_types": ["document_parsing_agent", "knowledge_extraction_agent", "knowledge_fusion_agent", "quality_evaluation_agent", "graph_management_agent"]},
+  {"case_id": "start_parse_only", "expected_intent": "START", "expected_agent_types": ["document_parsing_agent"]},
+  {"case_id": "start_entity_only", "expected_intent": "START", "expected_agent_types": ["knowledge_extraction_agent"]},
+  {"case_id": "start_relation_only", "expected_intent": "START", "expected_agent_types": ["knowledge_extraction_agent"]},
+  {"case_id": "start_entity_alignment", "expected_intent": "START", "expected_agent_types": ["knowledge_fusion_agent"]},
+  {"case_id": "reuse_published_ontology", "expected_intent": "START", "expected_agent_types": ["knowledge_extraction_agent"]},
+  {"case_id": "import_external_ontology", "expected_intent": "START", "expected_agent_types": ["knowledge_fusion_agent", "quality_evaluation_agent", "graph_management_agent"]},
+  {"case_id": "build_missing_ontology", "expected_intent": "START", "expected_agent_types": ["knowledge_extraction_agent", "knowledge_fusion_agent", "quality_evaluation_agent", "graph_management_agent"]},
+  {"case_id": "continue_current_task", "expected_intent": "CONTINUE", "expected_agent_types": ["knowledge_extraction_agent"]},
+  {"case_id": "modify_task_goal", "expected_intent": "MODIFY", "expected_agent_types": ["knowledge_extraction_agent"]},
+  {"case_id": "modify_ontology_choice", "expected_intent": "MODIFY", "expected_agent_types": ["knowledge_extraction_agent"]},
+  {"case_id": "continue_from_parsed_document", "expected_intent": "CONTINUE", "expected_agent_types": ["knowledge_extraction_agent"]},
+  {"case_id": "continue_from_entity_dataset", "expected_intent": "CONTINUE", "expected_agent_types": ["knowledge_extraction_agent", "knowledge_fusion_agent"]},
+  {"case_id": "continue_without_current_task", "expected_intent": "CONTINUE", "expected_agent_types": []},
+  {"case_id": "ambiguous_input", "expected_intent": "START", "expected_agent_types": []},
+  {"case_id": "ontology_review_required", "expected_intent": "START", "expected_agent_types": ["quality_evaluation_agent", "graph_management_agent"]},
+  {"case_id": "graph_review_required", "expected_intent": "START", "expected_agent_types": ["quality_evaluation_agent", "graph_management_agent"]},
+  {"case_id": "reject_knowledge_query", "expected_intent": "START", "expected_agent_types": []},
+  {"case_id": "reject_unapproved_publish", "expected_intent": "CONTINUE", "expected_agent_types": []},
+  {"case_id": "reject_unknown_agent", "expected_intent": "START", "expected_agent_types": []}
+]

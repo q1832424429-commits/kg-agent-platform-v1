@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <!-- 目录管理只调整显示名与可用状态；已审核资产正文保持不可变。 -->
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="知识图谱平台已发布本体与图谱资产库" />
+    <title>已发布本体与图谱</title>
+    <link rel="stylesheet" href="/workbench-assets/published_assets.css?v=20260929-1" />
+  </head>
+  <body>
+    <main class="asset-shell">
+      <header class="asset-header">
+        <div>
+          <p class="eyebrow">知识图谱 Agent 平台</p>
+          <h1>已发布资产</h1>
+          <p class="subtitle">这里管理经过人工审核的本体与图谱。修改显示名称不会修改已发布内容；删除会移出可复用目录，保留历史引用。</p>
+        </div>
+        <a href="/workbench">返回任务工作台</a>
+      </header>
+
+      <p id="notice" class="notice" aria-live="polite">正在读取已发布资产…</p>
+
+      <section class="asset-grid" aria-label="已发布资产目录">
+        <article class="asset-panel">
+          <div class="panel-heading"><h2>已发布本体</h2><span id="ontology-count" class="count">0</span></div>
+          <div id="ontology-list" class="asset-list"></div>
+        </article>
+        <article class="asset-panel">
+          <div class="panel-heading"><h2>已发布图谱</h2><span id="graph-count" class="count">0</span></div>
+          <div id="graph-list" class="asset-list"></div>
+        </article>
+      </section>
+
+      <section id="preview-panel" class="preview-panel" hidden>
+        <div class="panel-heading"><h2 id="preview-title">资产预览</h2><button id="close-preview" type="button">关闭</button></div>
+        <div id="preview-content"></div>
+      </section>
+    </main>
+    <!-- 已发布图谱使用与工作台相同的本地交互渲染器，保持查看体验一致。 -->
+    <script src="/workbench-assets/vendor/g6-5.1.1.min.js" defer></script>
+    <script src="/workbench-assets/graph_view.js" defer></script>
+    <script src="/workbench-assets/published_assets.js?v=20260929-1" defer></script>
+  </body>
+</html>

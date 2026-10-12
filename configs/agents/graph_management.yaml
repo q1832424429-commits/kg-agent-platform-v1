@@ -1,0 +1,42 @@
+agent_type: graph_management_agent
+name: 图谱管理更新 Agent
+version: 1.0.0
+description: 负责构建候选图谱、生成增量修改草案、应用已确认修改，并在确定性门禁通过后发布本体或图谱。
+accepted_subtask_types:
+  - graph_build
+  - graph_changeset_generate
+  - ontology_changeset_apply
+  - ontology_publish
+  - graph_changeset_apply
+  - graph_publish
+accepted_input_types:
+  - EntityDataset
+  - RelationDataset
+  - PropertyDataset
+  - EvidenceDataset
+  - ConflictReport
+  - PublishedOntology
+  - CandidateOntology
+  - FusedCandidateOntology
+  - OntologyChangeSet
+  - OntologyApproval
+  - CandidateGraph
+  - GraphChangeSet
+  - GraphApproval
+produced_output_types:
+  - CandidateOntology
+  - PublishedOntology
+  - CandidateGraph
+  - GraphChangeSet
+  - PublishedGraph
+allowed_skills:
+  - build_candidate_graph
+  - generate_graph_changeset
+  - apply_ontology_changeset
+  - publish_ontology
+  - apply_graph_changeset
+  - publish_graph
+can_publish_subtasks: false
+can_publish_ontology: true
+can_publish_graph: true
+lifecycle: ACTIVE

@@ -1,0 +1,2444 @@
+"""实现自定义 Agent、Skill 定义包的 PostgreSQL 生命周期服务。
+
+服务的职责只覆盖定义包的创建、修订、资源绑定、发布、停用和静态校验。它不将定义
+直接写进既有内置 Registry，更不会在 API 进程或 Worker 宿主机执行用户资源中的脚本。
+"""
+
+from __future__ import annotations
+
+import ast
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import PurePosixPath
+from typing import Any, cast
+from uuid import UUID, uuid4
+
+import yaml
+from sqlalchemy import delete, select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from kg_agent.domain.registry_models import AgentRegistration, SkillRegistration
+from kg_agent.exceptions import CustomExtensionValidationError, ModelGatewayError
+from kg_agent.extensions.contract_profiles import (
+    ContractProfileRegistry,
+    SkillContractProfile,
+    SkillProfileSelection,
+)
+from kg_agent.extensions.contracts import (
+    AvailableSkillOption,
+    BusinessAgentDraftInput,
+    BusinessSkillDraftInput,
+    CustomAgentDefinitionInput,
+    CustomAgentDetail,
+    CustomResourceSummary,
+    CustomRevisionSummary,
+    CustomSkillContractCheck,
+    CustomSkillDefinitionInput,
+    CustomSkillDetail,
+    SkillContractOption,
+    SkillContractProposal,
+)
+from kg_agent.extensions.script_adapter_generator import (
+    GENERATED_ENTRYPOINT,
+    render_entity_record_entry,
+    render_function_entry,
+)
+from kg_agent.extensions.script_contract_validation import (
+    SCRIPT_PROTOCOL_VERSION,
+    SCRIPT_RUNTIME_PROFILE_ID,
+    FilesystemScriptRunnerClient,
+    ScriptContractValidator,
+)
+from kg_agent.extensions.script_field_mapping import (
+    EntityRecordAdapter,
+    ScriptFunctionAdapter,
+    ScriptInputFieldBinding,
+    ScriptInputMappingProposal,
+    ScriptMappingSelection,
+    ScriptOutputFieldBinding,
+    ScriptOutputMappingProposal,
+    ScriptOutputMappingSelection,
+    ScriptSourceFieldOption,
+    detect_script_input_fields,
+    list_nested_source_fields,
+    list_script_output_targets,
+    list_script_source_fields,
+    recommend_function_field_bindings,
+    recommend_script_output_mapping,
+    unresolved_function_input_paths,
+)
+from kg_agent.extensions.script_signature import (
+    detect_function_field_paths,
+    inspect_script_functions,
+)
+from kg_agent.extensions.templates import (
+    checksum_for,
+    render_agent_markdown,
+    render_skill_markdown,
+    stable_json,
+)
+from kg_agent.infrastructure.database.models import (
+    CustomAgentRevisionRow,
+    CustomAgentRow,
+    CustomSkillContractCheckRow,
+    CustomSkillResourceRow,
+    CustomSkillRevisionRow,
+    CustomSkillRow,
+)
+from kg_agent.model_gateway.base import ModelCallContext, ModelGateway
+from kg_agent.registries.artifact_registry import ArtifactRegistry
+
+_BUILTIN_RESERVED_AGENT_KEYS = {"controller", "workflow", "planner", "executor"}
+_PUBLISH_SKILLS = {"publish_ontology", "publish_graph"}
+_PUBLISH_ARTIFACT_TYPES = {
+    "OntologyApproval",
+    "PublishedOntology",
+    "GraphApproval",
+    "PublishedGraph",
+}
+_MAX_CUSTOM_RESOURCE_BYTES = 2 * 1024 * 1024
+_MAX_CUSTOM_RESOURCE_TOTAL_BYTES = 8 * 1024 * 1024
+_MAX_CUSTOM_RESOURCES = 30
+
+
+@dataclass(frozen=True, slots=True)
+class ScriptBundle:
+    """绑定一次运行的不可变入口、修订校验和及脚本资源字节。"""
+
+    entrypoint: str
+    checksum: str
+    resources: tuple[tuple[str, bytes], ...]
+    input_bindings: tuple[ScriptInputFieldBinding, ...] = ()
+    output_bindings: tuple[ScriptOutputFieldBinding, ...] = ()
+    entity_record_adapter: EntityRecordAdapter | None = None
+
+
+class CustomExtensionService:
+    """以不可变修订管理用户自定义 Agent 与 Skill 定义包。
+
+    一个稳定定义可同时拥有一个已发布修订和一个编辑中的草稿修订；只有
+    ``current_revision_id`` 指向的已发布修订可被运行期动态发现。
+    """
+
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        *,
+        artifact_registry: ArtifactRegistry,
+        builtin_agent_keys: Sequence[str],
+        builtin_skill_keys: Sequence[str],
+        model_gateway: ModelGateway | None = None,
+        contract_profiles: ContractProfileRegistry | None = None,
+        script_contract_validator: ScriptContractValidator | None = None,
+    ) -> None:
+        """绑定数据源与内置能力目录，用于防止自定义定义覆盖系统内置身份。"""
+
+        self._session_factory = session_factory
+        self._artifacts = artifact_registry
+        self._builtin_agent_keys = set(builtin_agent_keys)
+        self._builtin_skill_keys = set(builtin_skill_keys)
+        self._model = model_gateway
+        self._contract_profiles = contract_profiles or ContractProfileRegistry.v1(artifact_registry)
+        self._script_contract_validator = script_contract_validator or ScriptContractValidator(
+            artifact_registry, FilesystemScriptRunnerClient()
+        )
+
+    @staticmethod
+    def _now() -> datetime:
+        """统一产生带 UTC 时区的定义包时间戳。"""
+
+        return datetime.now(UTC)
+
+    @staticmethod
+    def _generated_key(prefix: str) -> str:
+        """生成仅供运行期使用的稳定内部标识，不要求业务用户理解或填写。"""
+
+        return f"{prefix}_{uuid4().hex[:16]}"
+
+    @staticmethod
+    def _stable_unique(values: Sequence[str]) -> list[str]:
+        """按原始顺序去重能力契约，保证生成的 YAML 与 checksum 稳定。"""
+
+        return list(dict.fromkeys(values))
+
+    def _validate_skill_artifacts(self, value: CustomSkillDefinitionInput) -> None:
+        """验证 Skill 的 Artifact 类型；执行路径由实际上传资源决定。"""
+
+        for artifact_type in value.input_artifact_types + value.output_artifact_types:
+            self._artifacts.require(artifact_type)
+        names = [item.script_field for item in value.script_input_bindings]
+        if len(names) != len(set(names)):
+            raise CustomExtensionValidationError("脚本输入字段名不能重复")
+        for binding in value.script_input_bindings:
+            if binding.artifact_type not in value.input_artifact_types:
+                raise CustomExtensionValidationError(
+                    f"字段 {binding.script_field} 的来源类型不在 Skill 输入契约中"
+                )
+        if value.entity_record_adapter is not None:
+            if (
+                value.contract_profile_id != "entity_transform"
+                or value.input_artifact_types != ["EntityDataset"]
+                or value.output_artifact_types != ["EntityDataset"]
+            ):
+                raise CustomExtensionValidationError("实体逐项适配只适用于实体转换契约")
+            if value.script_input_bindings or value.script_output_bindings:
+                raise CustomExtensionValidationError("实体逐项适配不能与通用字段映射混用")
+        if value.entity_record_adapter is not None and value.function_adapter is not None:
+            raise CustomExtensionValidationError("同一 Skill 不能同时使用两种函数适配")
+        if value.function_adapter is not None:
+            if value.generated_script_entrypoint != GENERATED_ENTRYPOINT:
+                raise CustomExtensionValidationError("函数适配必须使用平台生成的标准入口")
+            bound = {item.script_field for item in value.script_input_bindings}
+            expected = {
+                item.parameter_name
+                for item in value.function_adapter.arguments
+                if item.source == "ARTIFACT_FIELD"
+            }
+            if bound != expected:
+                raise CustomExtensionValidationError("函数资料字段与输入映射不一致")
+            if any(
+                item.artifact_type not in value.input_artifact_types
+                for item in value.function_adapter.arguments
+                if item.source in {"ARTIFACT_CONTENT", "ARTIFACT_FIELD"}
+            ):
+                raise CustomExtensionValidationError("函数输入来源不属于当前上下游契约")
+        if value.generated_script_entrypoint is not None and (
+            value.generated_script_entrypoint != GENERATED_ENTRYPOINT
+            or (value.entity_record_adapter is None and value.function_adapter is None)
+        ):
+            raise CustomExtensionValidationError("平台生成入口必须对应已确认的函数适配")
+        targets: set[tuple[str, str]] = set()
+        for output_binding in value.script_output_bindings:
+            if output_binding.artifact_type not in value.output_artifact_types:
+                raise CustomExtensionValidationError("脚本输出映射目标不属于 Skill 输出契约")
+            definition = self._artifacts.require(output_binding.artifact_type)
+            model = definition.content_model
+            if model is None or output_binding.target_field not in model.model_fields:
+                raise CustomExtensionValidationError("脚本输出映射目标不是已注册的标准字段")
+            if output_binding.target_field == "schema_version":
+                raise CustomExtensionValidationError("脚本不能映射修改 Artifact Schema 版本")
+            allowed_records = {
+                option.source_pointer.rsplit("/", 1)[-1]
+                for option in list_nested_source_fields(
+                    self._artifacts, [output_binding.artifact_type]
+                )
+                if option.source_pointer.startswith(f"/{output_binding.target_field}/*/")
+            }
+            if output_binding.record_field_bindings and (
+                not allowed_records
+                or set(output_binding.record_field_bindings) - allowed_records
+                or any(
+                    not source.isidentifier()
+                    for source in output_binding.record_field_bindings.values()
+                )
+            ):
+                raise CustomExtensionValidationError("逐项输出映射包含未注册的目标字段或非法来源")
+            target = (output_binding.artifact_type, output_binding.target_field)
+            if target in targets:
+                raise CustomExtensionValidationError("脚本输出映射目标字段不能重复")
+            targets.add(target)
+        protected = _PUBLISH_ARTIFACT_TYPES.intersection(value.output_artifact_types)
+        if protected:
+            raise CustomExtensionValidationError(
+                f"自定义 Skill 不允许产生审核或发布产物：{sorted(protected)}"
+            )
+
+    def _validate_agent_artifacts(self, value: CustomAgentDefinitionInput) -> None:
+        """验证 Agent 的输入输出能力不虚构未注册 Artifact 类型。"""
+
+        for artifact_type in value.accepted_input_types + value.produced_output_types:
+            self._artifacts.require(artifact_type)
+        if (
+            value.agent_key in self._builtin_agent_keys
+            or value.agent_key in _BUILTIN_RESERVED_AGENT_KEYS
+        ):
+            raise CustomExtensionValidationError(
+                f"Agent 标识保留或已被内置 Agent 使用：{value.agent_key}"
+            )
+        if _PUBLISH_SKILLS.intersection(value.allowed_skill_names):
+            raise CustomExtensionValidationError("自定义 Agent 不允许获得本体或图谱发布 Skill 权限")
+
+    @staticmethod
+    def _validate_resource_path(relative_path: str) -> str:
+        """拒绝绝对路径和目录穿越，确保资源只能位于定义包虚拟目录内。"""
+
+        path = PurePosixPath(relative_path)
+        if (
+            not relative_path
+            or path.is_absolute()
+            or ".." in path.parts
+            or relative_path.startswith("./")
+            or path.name in {"", "."}
+        ):
+            raise CustomExtensionValidationError("资源路径必须是定义包内的相对 POSIX 路径")
+        return path.as_posix()
+
+    @staticmethod
+    def _infer_script_entrypoint(paths: Sequence[str]) -> str | None:
+        """根据当前修订实际上传的 Python 资源确定入口，不接受用户手工选择类型。"""
+
+        scripts = [path for path in paths if path.lower().endswith(".py")]
+        if len(scripts) == 1:
+            return scripts[0]
+        main_candidates = [path for path in scripts if PurePosixPath(path).name == "main.py"]
+        if len(main_candidates) == 1:
+            return main_candidates[0]
+        if scripts:
+            raise CustomExtensionValidationError("多个脚本文件时必须且只能包含一个 main.py 入口")
+        return None
+
+    @classmethod
+    def _resolve_script_entrypoint(
+        cls, paths: Sequence[str], metadata: dict[str, Any]
+    ) -> str | None:
+        """优先使用已绑定的生成入口；旧修订保持原有入口推断语义。"""
+
+        generated = metadata.get("generated_script_entrypoint")
+        if generated is None:
+            return cls._infer_script_entrypoint(paths)
+        if (
+            generated != GENERATED_ENTRYPOINT
+            or generated not in paths
+            or (
+                metadata.get("entity_record_adapter") is None
+                and metadata.get("function_adapter") is None
+            )
+        ):
+            raise CustomExtensionValidationError("平台生成入口与当前脚本资源或适配配置不一致")
+        return str(generated)
+
+    @staticmethod
+    def _script_bundle_checksum(
+        draft: CustomSkillRevisionRow,
+        entrypoint: str,
+        resources: Sequence[CustomSkillResourceRow],
+    ) -> str:
+        """绑定草稿定义、入口和全部资源，供检查记录与发布门禁共同核对。"""
+
+        return checksum_for(
+            draft.checksum,
+            entrypoint,
+            stable_json(
+                [
+                    {
+                        "relative_path": item.relative_path,
+                        "checksum": item.checksum,
+                        "size_bytes": item.size_bytes,
+                    }
+                    for item in resources
+                ]
+            ),
+        )
+
+    def _contract_profile_for_revision(self, draft: CustomSkillRevisionRow) -> SkillContractProfile:
+        """解析草稿契约；业务入口使用注册 Profile，兼容低层 API 的显式固定契约。"""
+
+        profile_id = cast(str | None, draft.metadata_json.get("contract_profile_id"))
+        if profile_id is not None:
+            return self._contract_profiles.require(profile_id)
+        return SkillContractProfile(
+            profile_id="direct_definition",
+            business_name="显式内部契约",
+            integration_mode=cast(
+                Any, draft.metadata_json.get("integration_mode") or "SIDE_OUTPUT"
+            ),
+            input_artifact_types=tuple(draft.metadata_json.get("input_artifact_types", [])),
+            output_artifact_types=tuple(draft.metadata_json.get("output_artifact_types", [])),
+            result_semantics=cast(Any, draft.metadata_json.get("result_semantics") or "DERIVE"),
+            input_description="定义包声明的输入 Artifact",
+            output_description="定义包声明的输出 Artifact",
+            suggested_position="仅供受控内部 API 兼容",
+        )
+
+    @staticmethod
+    def _validate_python_resources(resources: Sequence[CustomSkillResourceRow]) -> None:
+        """在进入隔离 Runner 前先拒绝非 UTF-8 或语法错误的 Python 文件。"""
+
+        for item in resources:
+            if not item.relative_path.lower().endswith(".py"):
+                continue
+            try:
+                ast.parse(item.content.decode("utf-8"), filename=item.relative_path)
+            except (UnicodeDecodeError, SyntaxError) as exc:
+                raise CustomExtensionValidationError(
+                    f"Python 资源无法通过 UTF-8/语法校验：{item.relative_path}"
+                ) from exc
+
+    async def check_skill_contract(self, skill_id: UUID) -> CustomSkillContractCheck:
+        """对当前脚本草稿执行依赖扫描与沙箱契约试运行，并持久化完整结论。"""
+
+        async with self._session_factory() as session:
+            skill = await session.get(CustomSkillRow, skill_id)
+            if skill is None:
+                raise CustomExtensionValidationError("自定义 Skill 不存在")
+            draft = await self._require_draft_skill_revision(session, skill_id)
+            resources = list(
+                await session.scalars(
+                    select(CustomSkillResourceRow)
+                    .where(CustomSkillResourceRow.skill_revision_id == draft.revision_id)
+                    .order_by(CustomSkillResourceRow.relative_path)
+                )
+            )
+            entrypoint = self._resolve_script_entrypoint(
+                [item.relative_path for item in resources], draft.metadata_json
+            )
+            if entrypoint is None:
+                raise CustomExtensionValidationError("当前草稿没有 Python 脚本，无需脚本契约检查")
+            self._validate_python_resources(resources)
+            profile = self._contract_profile_for_revision(draft)
+            bundle_checksum = self._script_bundle_checksum(draft, entrypoint, resources)
+            revision_id = draft.revision_id
+            timeout_seconds = int(draft.metadata_json.get("timeout_seconds", 180))
+            resource_bundle = tuple((item.relative_path, item.content) for item in resources)
+
+        result = await self._script_contract_validator.validate(
+            entrypoint=entrypoint,
+            resources=resource_bundle,
+            profile=profile,
+            timeout_seconds=timeout_seconds,
+            input_bindings=tuple(
+                ScriptInputFieldBinding.model_validate(item)
+                for item in draft.metadata_json.get("script_input_bindings", [])
+            ),
+            output_bindings=tuple(
+                ScriptOutputFieldBinding.model_validate(item)
+                for item in draft.metadata_json.get("script_output_bindings", [])
+            ),
+            entity_record_adapter=(
+                EntityRecordAdapter.model_validate(draft.metadata_json["entity_record_adapter"])
+                if draft.metadata_json.get("entity_record_adapter")
+                and entrypoint != GENERATED_ENTRYPOINT
+                else None
+            ),
+        )
+        checked_at = self._now()
+        row = CustomSkillContractCheckRow(
+            check_id=uuid4(),
+            skill_revision_id=revision_id,
+            contract_profile_id=profile.profile_id,
+            bundle_checksum=bundle_checksum,
+            runtime_profile_id=SCRIPT_RUNTIME_PROFILE_ID,
+            protocol_version=SCRIPT_PROTOCOL_VERSION,
+            status="PASSED" if result.passed else "FAILED",
+            report_json={
+                "dependency_findings": [
+                    item.model_dump(mode="json") for item in result.dependency_findings
+                ],
+                "diagnostics": list(result.diagnostics),
+                "observed_output_fields": list(result.observed_output_fields),
+                "observed_output_shapes": result.observed_output_shapes or {},
+                "duration_ms": result.duration_ms,
+            },
+            checked_at=checked_at,
+        )
+        async with self._session_factory() as session, session.begin():
+            # 草稿可能在耗时试运行期间被编辑；这种结果仍可审计，但不能绑定到不存在
+            # 或已经切换的修订。修订本身不可变，因此按 revision_id 保存即可。
+            if await session.get(CustomSkillRevisionRow, revision_id) is None:
+                raise CustomExtensionValidationError("试运行期间 Skill 草稿已不存在")
+            session.add(row)
+        return self._contract_check_detail(row)
+
+    async def create_skill(self, value: CustomSkillDefinitionInput) -> CustomSkillDetail:
+        """新建稳定 Skill 身份与首个草稿修订。"""
+
+        self._validate_skill_artifacts(value)
+        if value.skill_key in self._builtin_skill_keys:
+            raise CustomExtensionValidationError(
+                f"Skill 标识已被内置 Skill 使用：{value.skill_key}"
+            )
+        now = self._now()
+        metadata, markdown = render_skill_markdown(value)
+        checksum = checksum_for(markdown, stable_json(metadata), "SKILL_DEFINITION_V1")
+        skill_id, revision_id = uuid4(), uuid4()
+        async with self._session_factory() as session, session.begin():
+            existing = await session.scalar(
+                select(CustomSkillRow).where(CustomSkillRow.skill_key == value.skill_key)
+            )
+            if existing is not None:
+                raise CustomExtensionValidationError(f"Skill 标识已存在：{value.skill_key}")
+            # ORM 模型未声明父子 relationship；必须先 flush 身份记录，才能确保 PostgreSQL
+            # 不会在同一批 SQL 中先写入依赖其外键的 revision。
+            session.add(
+                CustomSkillRow(
+                    skill_id=skill_id,
+                    skill_key=value.skill_key,
+                    name=value.name,
+                    description=value.description,
+                    current_revision_id=None,
+                    status="DRAFT",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            await session.flush()
+            session.add(
+                CustomSkillRevisionRow(
+                    revision_id=revision_id,
+                    skill_id=skill_id,
+                    revision_number=1,
+                    metadata_json=metadata,
+                    skill_markdown=markdown,
+                    entrypoint=None,
+                    status="DRAFT",
+                    checksum=checksum,
+                    created_at=now,
+                    published_at=None,
+                )
+            )
+        return await self.get_skill(skill_id, include_definition=True)
+
+    async def create_business_skill(self, value: BusinessSkillDraftInput) -> CustomSkillDetail:
+        """把业务化 Skill 描述编译为受控的文档分析 Skill 草稿。
+
+        V1 不允许用户创建新的 Artifact Schema。为避免把内部契约暴露给非开发者，
+        该入口固定使用已解析文档作为输入、标准化表格结果作为输出；业务描述会进入
+        SKILL.md 正文，供后续 LLM 或用户脚本实现读取。
+        """
+
+        skill_key = self._generated_key("custom_skill")
+        return await self.create_skill(self._business_skill_definition(value, skill_key))
+
+    async def propose_business_skill_contract(
+        self, value: BusinessSkillDraftInput
+    ) -> SkillContractProposal:
+        """调用模型从受控模板中推荐使用方式，再由代码核验模板真实存在。
+
+        模型只返回模板 ID、置信度和理由。Artifact 类型、集成模式和上下游语义均从
+        代码注册表读取，模型无法伪造或扩展正式契约。
+        """
+
+        if self._model is None:
+            raise CustomExtensionValidationError("自定义 Skill 契约推断未配置模型网关")
+        profiles = self._contract_profiles.list_all()
+        profile_catalog = [
+            {
+                "profile_id": item.profile_id,
+                "business_name": item.business_name,
+                "integration_mode": item.integration_mode,
+                "input_description": item.input_description,
+                "output_description": item.output_description,
+                "suggested_position": item.suggested_position,
+            }
+            for item in profiles
+        ]
+        selection = await self._model.generate_structured(
+            system_prompt=(
+                "你负责理解用户自定义 Skill 的业务用途。只能从提供的 contract_profiles "
+                "中选择一个 profile_id，不得创造 Artifact、Agent、Skill 或发布权限。"
+                "PIPELINE 表示结果必须继续进入后续处理；SIDE_OUTPUT 表示读取已有业务资料"
+                "并直接交付结果；STANDALONE 表示不依赖知识图谱主流程。"
+            ),
+            user_prompt=stable_json(
+                {
+                    "skill_business_description": value.model_dump(exclude={"contract_profile_id"}),
+                    "contract_profiles": profile_catalog,
+                    "instruction": "选择最符合用户实际用途的一项并简要说明依据。",
+                }
+            ),
+            output_type=SkillProfileSelection,
+            call_context=ModelCallContext(
+                component="SKILL",
+                actor_name="custom_skill_contract_inference",
+                skill_name="custom_skill_contract_inference",
+            ),
+        )
+        selected = self._contract_profiles.require(selection.profile_id)
+        return SkillContractProposal(
+            selected=selected.public_option(),
+            confidence=selection.confidence,
+            reason=selection.reason,
+            requires_confirmation=True,
+            alternatives=[item.public_option() for item in profiles],
+        )
+
+    def list_business_skill_contracts(self) -> list[SkillContractOption]:
+        """返回业务化契约选项；调用方只能提交其中已有的 profile_id。"""
+
+        return [item.public_option() for item in self._contract_profiles.list_all()]
+
+    async def propose_script_input_mapping(self, skill_id: UUID) -> ScriptInputMappingProposal:
+        """静态读取草稿脚本字段，再让模型只从已注册来源中提出待确认建议。"""
+
+        async with self._session_factory() as session:
+            skill = await session.get(CustomSkillRow, skill_id)
+            if skill is None:
+                raise CustomExtensionValidationError("自定义 Skill 不存在")
+            draft = await self._require_draft_skill_revision(session, skill_id)
+            resources = list(
+                await session.scalars(
+                    select(CustomSkillResourceRow).where(
+                        CustomSkillResourceRow.skill_revision_id == draft.revision_id
+                    )
+                )
+            )
+            entrypoint = self._infer_script_entrypoint([item.relative_path for item in resources])
+            if entrypoint is None:
+                raise CustomExtensionValidationError("当前草稿没有可执行 Python 脚本")
+            source = next(item.content for item in resources if item.relative_path == entrypoint)
+            profile = self._contract_profile_for_revision(draft)
+            description = skill.description
+        detected = detect_script_input_fields(source)
+        options = list_script_source_fields(self._artifacts, list(profile.input_artifact_types))
+        suggestions: list[ScriptInputFieldBinding] = []
+        # 同名且来源唯一时先由代码匹配，避免为确定性事实调用模型。
+        for field in detected:
+            matches = [item for item in options if item.source_pointer == f"/{field}"]
+            if len(matches) == 1:
+                suggestions.append(
+                    ScriptInputFieldBinding(
+                        script_field=field,
+                        artifact_type=matches[0].artifact_type,
+                        source_pointer=matches[0].source_pointer,
+                    )
+                )
+        selected_names = {item.script_field for item in suggestions}
+        unresolved = [field for field in detected if field not in selected_names]
+        reason = "同名字段已按唯一注册来源预填；其余字段请确认。"
+        if unresolved and options and self._model is not None:
+            try:
+                choice = await self._model.generate_structured(
+                    system_prompt=(
+                        "你只提出脚本字段与已有资料字段之间的候选语义映射。"
+                        "仅能使用输入给出的 detected_fields、artifact_type 和 source_pointer。"
+                        "不确定时不要猜，留空供用户确认；不得创建新的 Artifact 字段。"
+                    ),
+                    user_prompt=stable_json(
+                        {
+                            "skill_description": description[:1500],
+                            "detected_fields": unresolved,
+                            "source_fields": [item.model_dump(mode="json") for item in options],
+                        }
+                    ),
+                    output_type=ScriptMappingSelection,
+                    call_context=ModelCallContext(
+                        component="SKILL",
+                        actor_name="custom_skill_input_mapping",
+                        skill_name="custom_skill_input_mapping",
+                    ),
+                )
+            except ModelGatewayError:
+                # 建议失败不阻断人工选择；正式映射仍必须逐项由用户确认。
+                choice = ScriptMappingSelection(reason="模型建议暂不可用，请人工选择字段来源。")
+            allowed = {(item.artifact_type, item.source_pointer) for item in options}
+            seen = set(selected_names)
+            for binding in choice.suggested_bindings:
+                if (
+                    binding.script_field not in unresolved
+                    or binding.script_field in seen
+                    or (binding.artifact_type, binding.source_pointer) not in allowed
+                ):
+                    continue
+                suggestions.append(binding)
+                seen.add(binding.script_field)
+            reason = choice.reason[:1000]
+        suggested_names = {item.script_field for item in suggestions}
+        return ScriptInputMappingProposal(
+            detected_fields=detected,
+            source_fields=options,
+            suggested_bindings=suggestions,
+            unresolved_fields=[field for field in detected if field not in suggested_names],
+            reason=reason,
+        )
+
+    async def confirm_script_input_mapping(
+        self, skill_id: UUID, bindings: list[ScriptInputFieldBinding]
+    ) -> CustomSkillDetail:
+        """用户确认映射后创建新草稿修订，保留脚本资源并重新要求契约试运行。"""
+
+        async with self._session_factory() as session:
+            skill = await session.get(CustomSkillRow, skill_id)
+            if skill is None:
+                raise CustomExtensionValidationError("自定义 Skill 不存在")
+            draft = await self._require_draft_skill_revision(session, skill_id)
+            resources = list(
+                await session.scalars(
+                    select(CustomSkillResourceRow).where(
+                        CustomSkillResourceRow.skill_revision_id == draft.revision_id
+                    )
+                )
+            )
+            entrypoint = self._infer_script_entrypoint([item.relative_path for item in resources])
+            if entrypoint is None:
+                raise CustomExtensionValidationError("当前草稿没有可执行 Python 脚本")
+            source = next(item.content for item in resources if item.relative_path == entrypoint)
+            detected = detect_script_input_fields(source)
+            profile = self._contract_profile_for_revision(draft)
+            options = list_script_source_fields(self._artifacts, list(profile.input_artifact_types))
+            allowed = {(item.artifact_type, item.source_pointer) for item in options}
+            names = [item.script_field for item in bindings]
+            if len(names) != len(set(names)) or set(names) != set(detected):
+                raise CustomExtensionValidationError(
+                    "脚本字段映射必须逐一覆盖已检测的字段，且不能重复"
+                )
+            if any((item.artifact_type, item.source_pointer) not in allowed for item in bindings):
+                raise CustomExtensionValidationError("字段来源不属于当前契约的已注册输入")
+            metadata = draft.metadata_json
+            definition = CustomSkillDefinitionInput.model_validate(
+                {
+                    **metadata,
+                    "skill_key": skill.skill_key,
+                    "name": skill.name,
+                    "description": skill.description,
+                    "instruction_markdown": self._markdown_body(draft.skill_markdown),
+                    "script_input_bindings": bindings,
+                }
+            )
+        return await self.update_skill(skill_id, definition)
+
+    async def propose_entity_record_adapter(self, skill_id: UUID) -> dict[str, object]:
+        """静态列出实体转换脚本的函数、参数和字典返回键，供用户确认。"""
+
+        async with self._session_factory() as session:
+            skill = await session.get(CustomSkillRow, skill_id)
+            if skill is None:
+                raise CustomExtensionValidationError("自定义 Skill 不存在")
+            draft = await self._require_draft_skill_revision(session, skill_id)
+            if self._contract_profile_for_revision(draft).profile_id != "entity_transform":
+                raise CustomExtensionValidationError("只有实体转换能力可使用逐项适配")
+            resources = list(
+                await session.scalars(
+                    select(CustomSkillResourceRow).where(
+                        CustomSkillResourceRow.skill_revision_id == draft.revision_id
+                    )
+                )
+            )
+            # 平台入口是适配产物，不作为用户可选择的业务函数来源。
+            entrypoint = self._infer_script_entrypoint(
+                [
+                    item.relative_path
+                    for item in resources
+                    if item.relative_path != GENERATED_ENTRYPOINT
+                ]
+            )
+            if entrypoint is None:
+                raise CustomExtensionValidationError("当前草稿没有 Python 脚本")
+            source = next(item.content for item in resources if item.relative_path == entrypoint)
+        try:
+            tree = ast.parse(source.decode("utf-8"))
+        except (UnicodeDecodeError, SyntaxError) as exc:
+            raise CustomExtensionValidationError("脚本入口无法解析") from exc
+        functions: list[dict[str, object]] = []
+        for node in tree.body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.name == "run":
+                continue
+            if (
+                len(node.args.args) != 1
+                or node.args.posonlyargs
+                or node.args.kwonlyargs
+                or node.args.vararg
+                or node.args.kwarg
+            ):
+                continue
+            keys = sorted(
+                {
+                    key.value
+                    for child in ast.walk(node)
+                    if isinstance(child, ast.Return) and isinstance(child.value, ast.Dict)
+                    for key in child.value.keys
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str)
+                }
+            )
+            functions.append(
+                {
+                    "function_name": node.name,
+                    "parameter_name": node.args.args[0].arg,
+                    "result_fields": [*keys, "__value__"],
+                }
+            )
+        return {
+            "functions": functions,
+            "standard_entrypoint": inspect_script_functions(source)["standard_entrypoint"],
+            "source_field": "实体名称",
+            "target_field": "标准化实体名称",
+        }
+
+    async def propose_script_function_adapter(self, skill_id: UUID) -> dict[str, object]:
+        """列出用户脚本可用函数与标准输入字段，供界面确认参数映射。"""
+
+        async with self._session_factory() as session:
+            skill = await session.get(CustomSkillRow, skill_id)
+            if skill is None:
+                raise CustomExtensionValidationError("自定义 Skill 不存在")
+            draft = await self._require_draft_skill_revision(session, skill_id)
+            profile = self._contract_profile_for_revision(draft)
+            resources = list(
+                await session.scalars(
+                    select(CustomSkillResourceRow).where(
+                        CustomSkillResourceRow.skill_revision_id == draft.revision_id
+                    )
+                )
+            )
+            source_path = self._infer_script_entrypoint(
+                [
+                    item.relative_path
+                    for item in resources
+                    if item.relative_path != GENERATED_ENTRYPOINT
+                ]
+            )
+            if source_path is None:
+                raise CustomExtensionValidationError("当前草稿没有 Python 脚本")
+            source = next(item.content for item in resources if item.relative_path == source_path)
+        try:
+            inspected = inspect_script_functions(source)
+        except (UnicodeDecodeError, SyntaxError) as exc:
+            raise CustomExtensionValidationError("脚本入口无法解析") from exc
+        source_fields = [
+            item.model_dump(mode="json")
+            for item in list_script_source_fields(
+                self._artifacts, list(profile.input_artifact_types)
+            )
+        ]
+        suggestions: list[dict[str, object]] = []
+        for function in inspected["functions"]:
+            arguments: list[dict[str, object]] = []
+            for parameter in function["parameters"]:
+                lowered = parameter.lower()
+                accessed_keys = set(function["accessed_keys"].get(parameter, []))
+                field_names = {item["source_pointer"].rsplit("/", 1)[-1] for item in source_fields}
+                if (
+                    len(profile.input_artifact_types) == 1
+                    and accessed_keys
+                    and accessed_keys.issubset(field_names)
+                    and not accessed_keys.intersection({"inputs", "parameters"})
+                ):
+                    arguments.append(
+                        {
+                            "parameter_name": parameter,
+                            "source": "ARTIFACT_CONTENT",
+                            "artifact_type": profile.input_artifact_types[0],
+                        }
+                    )
+                elif lowered in {"payload", "context", "request"}:
+                    # 脚本读取的是业务字段时，不能仅凭参数名误判为平台任务包。
+                    if (
+                        len(profile.input_artifact_types) == 1
+                        and accessed_keys
+                        and not accessed_keys.issubset({"inputs", "parameters"})
+                    ):
+                        arguments.append(
+                            {
+                                "parameter_name": parameter,
+                                "source": "ARTIFACT_CONTENT",
+                                "artifact_type": profile.input_artifact_types[0],
+                            }
+                        )
+                    else:
+                        arguments.append({"parameter_name": parameter, "source": "TASK_PAYLOAD"})
+                elif lowered in {"inputs", "artifacts"}:
+                    arguments.append({"parameter_name": parameter, "source": "INPUTS"})
+                else:
+                    matches = [
+                        item
+                        for item in source_fields
+                        if item["source_pointer"].rsplit("/", 1)[-1].lower() == lowered
+                    ]
+                    if len(matches) == 1:
+                        arguments.append(
+                            {
+                                "parameter_name": parameter,
+                                "source": "ARTIFACT_FIELD",
+                                "artifact_type": matches[0]["artifact_type"],
+                                "source_pointer": matches[0]["source_pointer"],
+                            }
+                        )
+            suggestions.append({"function_name": function["function_name"], "arguments": arguments})
+        nested_options = list_nested_source_fields(
+            self._artifacts, list(profile.input_artifact_types)
+        )
+        for function in inspected["functions"]:
+            function_name = function["function_name"]
+            reads = detect_function_field_paths(source, function_name)
+            suggested_fields: list[dict[str, object]] = []
+            unresolved_fields: list[dict[str, str]] = []
+            for parameter, paths in reads.items():
+                if len(profile.input_artifact_types) != 1:
+                    unresolved_fields.extend(
+                        {"parameter_name": parameter, "target_pointer": path}
+                        for path in paths
+                        if "*" in path
+                    )
+                    continue
+                artifact_type = profile.input_artifact_types[0]
+                bindings, unresolved = recommend_function_field_bindings(
+                    parameter, artifact_type, paths, nested_options
+                )
+                suggested_fields.extend(item.model_dump(mode="json") for item in bindings)
+                unresolved_fields.extend(
+                    {"parameter_name": parameter, "target_pointer": path} for path in unresolved
+                )
+            function["field_reads"] = reads
+            function["field_suggestions"] = suggested_fields
+            function["unresolved_fields"] = unresolved_fields
+        return {
+            **inspected,
+            "input_artifact_types": list(profile.input_artifact_types),
+            "input_description": profile.input_description,
+            "source_fields": source_fields,
+            "nested_source_fields": [item.model_dump(mode="json") for item in nested_options],
+            "collection_source_fields": [
+                item
+                for item in source_fields
+                if any(
+                    nested.source_pointer.startswith(item["source_pointer"] + "/*/")
+                    for nested in nested_options
+                )
+            ],
+            "suggested_bindings": suggestions,
+        }
+
+    async def confirm_script_function_adapter(
+        self, skill_id: UUID, adapter: ScriptFunctionAdapter
+    ) -> CustomSkillDetail:
+        """保存用户确认的函数参数来源，并生成与试运行共用的隔离入口。"""
+
+        proposal = await self.propose_script_function_adapter(skill_id)
+        functions = proposal["functions"]
+        assert isinstance(functions, list)
+        if not any(
+            item["function_name"] == adapter.function_name
+            and item["parameters"] == [argument.parameter_name for argument in adapter.arguments]
+            for item in functions
+        ):
+            raise CustomExtensionValidationError("函数或参数与当前脚本不一致，请重新确认")
+        source_fields = cast(list[dict[str, str]], proposal["source_fields"])
+        available = {(item["artifact_type"], item["source_pointer"]) for item in source_fields}
+        bindings = [
+            ScriptInputFieldBinding(
+                script_field=item.parameter_name,
+                artifact_type=item.artifact_type or "",
+                source_pointer=item.source_pointer or "",
+            )
+            for item in adapter.arguments
+            if item.source == "ARTIFACT_FIELD"
+        ]
+        if any((item.artifact_type, item.source_pointer) not in available for item in bindings):
+            raise CustomExtensionValidationError("参数来源不属于当前 Skill 的标准输入契约")
+        input_artifact_types = cast(list[str], proposal["input_artifact_types"])
+        if any(
+            item.artifact_type not in input_artifact_types
+            for item in adapter.arguments
+            if item.source == "ARTIFACT_CONTENT"
+        ):
+            raise CustomExtensionValidationError("完整产物来源不属于当前 Skill 输入契约")
+        nested_fields = cast(list[dict[str, str]], proposal["nested_source_fields"])
+        nested_available = {
+            (item["artifact_type"], item["source_pointer"]) for item in nested_fields
+        }
+        nested_available.update(
+            (item["artifact_type"], item["source_pointer"])
+            for item in cast(list[dict[str, str]], proposal["collection_source_fields"])
+        )
+        selected_function = next(
+            item for item in functions if item["function_name"] == adapter.function_name
+        )
+        detected_targets = {
+            (parameter, pointer)
+            for parameter, paths in selected_function["field_reads"].items()
+            for pointer in paths
+        }
+        if any(
+            (item.artifact_type, item.source_pointer) not in nested_available
+            or (item.parameter_name, item.target_pointer) not in detected_targets
+            for item in adapter.field_bindings
+        ):
+            raise CustomExtensionValidationError("字段映射必须来自当前契约及脚本实际读取路径")
+        all_source_options = [
+            ScriptSourceFieldOption.model_validate(item)
+            for item in [
+                *source_fields,
+                *nested_fields,
+            ]
+        ]
+        missing_by_parameter: list[str] = []
+        for argument in adapter.arguments:
+            paths = selected_function["field_reads"].get(argument.parameter_name, [])
+            if argument.source == "ARTIFACT_CONTENT" and argument.artifact_type:
+                missing = unresolved_function_input_paths(
+                    argument.parameter_name,
+                    argument.artifact_type,
+                    paths,
+                    all_source_options,
+                    adapter.field_bindings,
+                )
+                missing_by_parameter.extend(
+                    f"{argument.parameter_name}{path}" for path in missing
+                )
+            elif argument.source == "TASK_PAYLOAD":
+                # 任务包只含 inputs / parameters；业务字段必须选择 Artifact 内容。
+                missing_by_parameter.extend(
+                    f"{argument.parameter_name}{path}"
+                    for path in paths
+                    if path.split("/")[1] not in {"inputs", "parameters"}
+                )
+        if missing_by_parameter:
+            raise CustomExtensionValidationError(
+                "脚本读取的字段在已选上游内容中不存在或尚未确认映射："
+                + "、".join(sorted(set(missing_by_parameter)))
+            )
+        async with self._session_factory() as session:
+            skill = await session.get(CustomSkillRow, skill_id)
+            if skill is None:
+                raise CustomExtensionValidationError("自定义 Skill 不存在")
+            draft = await self._require_draft_skill_revision(session, skill_id)
+            resources = list(
+                await session.scalars(
+                    select(CustomSkillResourceRow).where(
+                        CustomSkillResourceRow.skill_revision_id == draft.revision_id
+                    )
+                )
+            )
+            source_path = self._infer_script_entrypoint(
+                [
+                    item.relative_path
+                    for item in resources
+                    if item.relative_path != GENERATED_ENTRYPOINT
+                ]
+            )
+            if source_path is None:
+                raise CustomExtensionValidationError("当前草稿没有 Python 脚本")
+            definition = CustomSkillDefinitionInput.model_validate(
+                {
+                    **draft.metadata_json,
+                    "skill_key": skill.skill_key,
+                    "name": skill.name,
+                    "description": skill.description,
+                    "instruction_markdown": self._markdown_body(draft.skill_markdown),
+                    "script_input_bindings": [item.model_dump(mode="json") for item in bindings],
+                    "entity_record_adapter": None,
+                    "function_adapter": adapter.model_dump(mode="json"),
+                    "generated_script_entrypoint": GENERATED_ENTRYPOINT,
+                }
+            )
+        self._validate_skill_artifacts(definition)
+        await self.update_skill(skill_id, definition)
+        await self.add_skill_resource(
+            skill_id,
+            relative_path=GENERATED_ENTRYPOINT,
+            media_type="text/x-python",
+            content=render_function_entry(source_path, adapter),
+            system_generated=True,
+        )
+        return await self.get_skill(skill_id, include_definition=True)
+
+    async def confirm_entity_record_adapter(
+        self, skill_id: UUID, adapter: EntityRecordAdapter
+    ) -> CustomSkillDetail:
+        """保存用户确认的逐项适配配置，生成新草稿并使旧试运行失效。"""
+
+        proposal = await self.propose_entity_record_adapter(skill_id)
+        options = proposal["functions"]
+        if not isinstance(options, list) or not any(
+            item["function_name"] == adapter.function_name
+            and item["parameter_name"] == adapter.parameter_name
+            for item in options
+        ):
+            raise CustomExtensionValidationError("选定函数及参数不属于当前脚本入口")
+        async with self._session_factory() as session:
+            skill = await session.get(CustomSkillRow, skill_id)
+            if skill is None:
+                raise CustomExtensionValidationError("自定义 Skill 不存在")
+            draft = await self._require_draft_skill_revision(session, skill_id)
+            resources = list(
+                await session.scalars(
+                    select(CustomSkillResourceRow).where(
+                        CustomSkillResourceRow.skill_revision_id == draft.revision_id
+                    )
+                )
+            )
+            source_path = self._infer_script_entrypoint(
+                [
+                    item.relative_path
+                    for item in resources
+                    if item.relative_path != GENERATED_ENTRYPOINT
+                ]
+            )
+            if source_path is None:
+                raise CustomExtensionValidationError("当前草稿缺少用户原脚本")
+            definition = CustomSkillDefinitionInput.model_validate(
+                {
+                    **draft.metadata_json,
+                    "skill_key": skill.skill_key,
+                    "name": skill.name,
+                    "description": skill.description,
+                    "instruction_markdown": self._markdown_body(draft.skill_markdown),
+                    "script_input_bindings": [],
+                    "script_output_bindings": [],
+                    "entity_record_adapter": adapter.model_dump(mode="json"),
+                    "generated_script_entrypoint": GENERATED_ENTRYPOINT,
+                }
+            )
+        self._validate_skill_artifacts(definition)
+        await self.update_skill(skill_id, definition)
+        await self.add_skill_resource(
+            skill_id,
+            relative_path=GENERATED_ENTRYPOINT,
+            media_type="text/x-python",
+            content=render_entity_record_entry(source_path, adapter),
+            system_generated=True,
+        )
+        return await self.get_skill(skill_id, include_definition=True)
+
+    async def propose_script_output_mapping(self, skill_id: UUID) -> ScriptOutputMappingProposal:
+        """列出当前草稿沙箱试运行观测的字段及注册目标，建议不直接入库。"""
+
+        async with self._session_factory() as session:
+            skill = await session.get(CustomSkillRow, skill_id)
+            if skill is None:
+                raise CustomExtensionValidationError("自定义 Skill 不存在")
+            draft = await self._require_draft_skill_revision(session, skill_id)
+            profile = self._contract_profile_for_revision(draft)
+            if len(profile.output_artifact_types) != 1:
+                raise CustomExtensionValidationError("多产物脚本暂不支持普通 JSON 输出字段映射")
+            check = await session.scalar(
+                select(CustomSkillContractCheckRow)
+                .where(CustomSkillContractCheckRow.skill_revision_id == draft.revision_id)
+                .order_by(CustomSkillContractCheckRow.checked_at.desc())
+                .limit(1)
+            )
+            observed = (
+                list(check.report_json.get("observed_output_fields", []))
+                if check is not None
+                else []
+            )
+            skill_description = skill.description
+            existing = [
+                ScriptOutputFieldBinding.model_validate(item)
+                for item in draft.metadata_json.get("script_output_bindings", [])
+            ]
+        output_type = profile.output_artifact_types[0]
+        targets = list_script_output_targets(self._artifacts, output_type)
+        shapes = (
+            dict(check.report_json.get("observed_output_shapes", {})) if check is not None else {}
+        )
+        proposal = recommend_script_output_mapping(
+            output_type,
+            observed,
+            shapes,
+            targets,
+            list_nested_source_fields(self._artifacts, [output_type]),
+        )
+        if existing:
+            proposal.suggested_bindings = existing
+            return proposal
+        covered = {item.target_field for item in proposal.suggested_bindings}
+        missing_targets = {
+            item.target_field for item in targets if item.target_field not in covered
+        }
+        missing_records = {
+            item.target_field: sorted(
+                set(proposal.target_record_fields.get(item.target_field, []))
+                - set(item.record_field_bindings)
+            )
+            for item in proposal.suggested_bindings
+        }
+        if (
+            observed
+            and self._model is not None
+            and (missing_targets or any(missing_records.values()))
+        ):
+            try:
+                choice = await self._model.generate_structured(
+                    system_prompt=(
+                        "你只分析已上传脚本的实际试运行输出字段形状和已注册的目标"
+                        " Artifact Schema，提出待用户确认的字段映射。"
+                        "只能引用给定的脚本顶层字段、列表记录字段与目标字段；"
+                        "字段含义不确定时留空，不得凭空补值、假定实体合并已处理，"
+                        "也不得输出脚本原始业务数据。"
+                    ),
+                    user_prompt=stable_json(
+                        {
+                            "skill_description": skill_description[:1000],
+                            "output_artifact_type": output_type,
+                            "observed_fields": observed,
+                            "observed_shapes": shapes,
+                            "observed_record_fields": proposal.observed_record_fields,
+                            "target_fields": [item.model_dump(mode="json") for item in targets],
+                            "target_record_fields": proposal.target_record_fields,
+                            "confirmed_by_code": [
+                                item.model_dump(mode="json") for item in proposal.suggested_bindings
+                            ],
+                            "instruction": "只补充尚未唯一匹配的目标和记录字段。",
+                        }
+                    ),
+                    output_type=ScriptOutputMappingSelection,
+                    call_context=ModelCallContext(
+                        component="SKILL",
+                        actor_name="custom_skill_output_mapping",
+                        skill_name="custom_skill_output_mapping",
+                    ),
+                )
+            except ModelGatewayError:
+                choice = ScriptOutputMappingSelection()
+            by_target = {item.target_field: item for item in proposal.suggested_bindings}
+            allowed_targets = {item.target_field for item in targets}
+            for candidate in choice.suggested_bindings:
+                source_name = candidate.source_pointer.removeprefix("/")
+                if (
+                    candidate.artifact_type != output_type
+                    or candidate.target_field not in allowed_targets
+                    or candidate.source_pointer != f"/{source_name}"
+                    or source_name not in observed
+                ):
+                    continue
+                allowed_source_records = set(proposal.observed_record_fields.get(source_name, []))
+                allowed_target_records = set(
+                    proposal.target_record_fields.get(candidate.target_field, [])
+                )
+                valid_records = {
+                    target: source
+                    for target, source in candidate.record_field_bindings.items()
+                    if target in allowed_target_records and source in allowed_source_records
+                }
+                previous = by_target.get(candidate.target_field)
+                if previous is not None:
+                    if previous.source_pointer == candidate.source_pointer:
+                        previous.record_field_bindings.update(
+                            {
+                                key: value
+                                for key, value in valid_records.items()
+                                if key not in previous.record_field_bindings
+                            }
+                        )
+                    continue
+                by_target[candidate.target_field] = ScriptOutputFieldBinding(
+                    artifact_type=output_type,
+                    source_pointer=candidate.source_pointer,
+                    target_field=candidate.target_field,
+                    record_field_bindings=valid_records,
+                )
+            proposal.suggested_bindings = list(by_target.values())
+        return proposal
+
+    async def confirm_script_output_mapping(
+        self, skill_id: UUID, bindings: list[ScriptOutputFieldBinding]
+    ) -> CustomSkillDetail:
+        """确认原始脚本字段到已有标准 Artifact 字段的映射并生成新草稿修订。"""
+
+        async with self._session_factory() as session:
+            skill = await session.get(CustomSkillRow, skill_id)
+            if skill is None:
+                raise CustomExtensionValidationError("自定义 Skill 不存在")
+            draft = await self._require_draft_skill_revision(session, skill_id)
+            profile = self._contract_profile_for_revision(draft)
+            if len(profile.output_artifact_types) != 1:
+                raise CustomExtensionValidationError("多产物脚本暂不支持普通 JSON 输出字段映射")
+            metadata = draft.metadata_json
+            definition = CustomSkillDefinitionInput.model_validate(
+                {
+                    **metadata,
+                    "skill_key": skill.skill_key,
+                    "name": skill.name,
+                    "description": skill.description,
+                    "instruction_markdown": self._markdown_body(draft.skill_markdown),
+                    "script_output_bindings": bindings,
+                }
+            )
+        self._validate_skill_artifacts(definition)
+        proposal = await self.propose_script_output_mapping(skill_id)
+        observed = set(proposal.observed_fields)
+        for binding in bindings:
+            source_name = binding.source_pointer.lstrip("/")
+            if binding.source_pointer != f"/{source_name}" or source_name not in observed:
+                raise CustomExtensionValidationError("脚本输出来源不在本次试运行观测字段中")
+            record_fields = set(proposal.observed_record_fields.get(source_name, []))
+            if binding.record_field_bindings and (
+                not record_fields or set(binding.record_field_bindings.values()) - record_fields
+            ):
+                raise CustomExtensionValidationError("脚本输出记录字段未在本次试运行中出现")
+        return await self.update_skill(skill_id, definition)
+
+    def _business_skill_definition(
+        self, value: BusinessSkillDraftInput, skill_key: str
+    ) -> CustomSkillDefinitionInput:
+        """将业务表单编译为用户已确认的受控契约，供创建和编辑复用。
+
+        非开发者始终只编辑业务描述和业务化使用方式；真正的 Artifact 类型只能来自
+        ContractProfileRegistry，浏览器和模型都不能自由创造内部输入输出。
+        """
+
+        profile = self._contract_profiles.require(value.contract_profile_id)
+        subtask_type = f"{skill_key}_task"
+        instruction = "\n".join(
+            [
+                f"你正在执行用户定义的能力：{value.name}。",
+                f"要解决的问题：{value.solves_problem}",
+                f"适用资料：{value.applicable_materials}",
+                f"用户期待的结果：{value.expected_result}",
+                f"典型用户请求：{value.example_request}",
+                (
+                    f"补充要求：{value.additional_requirements}"
+                    if value.additional_requirements.strip()
+                    else ""
+                ),
+                (
+                    "只依据输入 Artifact 和当前任务上下文作答，不编造来源中不存在的事实。"
+                    if profile.input_artifact_types
+                    else "只依据当前任务目标、用户问题和授权上下文作答，不编造未知事实。"
+                ),
+                (
+                    "必须严格生成运行时指定的输出 Artifact JSON Schema，"
+                    "不得返回自由文本替代结构化产物。"
+                ),
+                "涉及来源资料时，应尽可能保留可追溯的原文位置或证据摘要。",
+                "不得构建、审核或发布本体和图谱，也不得调用未授权能力。",
+                f"能力使用方式：{profile.business_name}。",
+                f"接收内容：{profile.input_description}。",
+                f"交付内容：{profile.output_description}。",
+            ]
+        ).strip()
+        return CustomSkillDefinitionInput(
+            skill_key=skill_key,
+            name=value.name,
+            description=value.solves_problem,
+            supported_subtask_types=[subtask_type],
+            input_artifact_types=list(profile.input_artifact_types),
+            output_artifact_types=list(profile.output_artifact_types),
+            instruction_markdown=instruction,
+            business_input=value.model_dump(exclude={"contract_profile_id"}),
+            contract_profile_id=profile.profile_id,
+            integration_mode=profile.integration_mode,
+            result_semantics=profile.result_semantics,
+        )
+
+    async def update_business_skill(
+        self, skill_id: UUID, value: BusinessSkillDraftInput
+    ) -> CustomSkillDetail:
+        """以业务语言创建 Skill 的新草稿修订，保留稳定内部标识与已有资源。"""
+
+        async with self._session_factory() as session:
+            skill = await session.get(CustomSkillRow, skill_id)
+            if skill is None:
+                raise CustomExtensionValidationError("自定义 Skill 不存在")
+            skill_key = skill.skill_key
+            selected = await self._draft_skill_revision(session, skill_id)
+            if selected is None:
+                selected = await self._skill_revision_by_id(session, skill.current_revision_id)
+            # 编辑表单不要求用户重新选择技术契约；没有显式确认新模板时保留当前草稿
+            # 或已发布修订的 Profile，避免把流程型能力静默重置成旧版文档分析。
+            if value.contract_profile_id is None:
+                profile_id = (
+                    selected.metadata_json.get("contract_profile_id")
+                    if selected is not None
+                    else None
+                )
+                value = value.model_copy(
+                    update={
+                        "contract_profile_id": (
+                            profile_id or ContractProfileRegistry.LEGACY_DEFAULT_PROFILE
+                        )
+                    }
+                )
+        definition = self._business_skill_definition(value, skill_key)
+        if (
+            selected is not None
+            and selected.metadata_json.get("contract_profile_id") == value.contract_profile_id
+        ):
+            definition.script_input_bindings = [
+                ScriptInputFieldBinding.model_validate(item)
+                for item in selected.metadata_json.get("script_input_bindings", [])
+            ]
+            definition.script_output_bindings = [
+                ScriptOutputFieldBinding.model_validate(item)
+                for item in selected.metadata_json.get("script_output_bindings", [])
+            ]
+            if selected.metadata_json.get("function_adapter"):
+                definition.function_adapter = ScriptFunctionAdapter.model_validate(
+                    selected.metadata_json["function_adapter"]
+                )
+                definition.generated_script_entrypoint = selected.metadata_json.get(
+                    "generated_script_entrypoint"
+                )
+            if selected.metadata_json.get("entity_record_adapter"):
+                definition.entity_record_adapter = EntityRecordAdapter.model_validate(
+                    selected.metadata_json["entity_record_adapter"]
+                )
+                definition.generated_script_entrypoint = selected.metadata_json.get(
+                    "generated_script_entrypoint"
+                )
+        return await self.update_skill(skill_id, definition)
+
+    async def create_business_agent(
+        self,
+        value: BusinessAgentDraftInput,
+        *,
+        available_skills: Sequence[AvailableSkillOption],
+    ) -> CustomAgentDetail:
+        """把业务化职责与已选 Skill 编译为受控 Agent 草稿。
+
+        浏览器只提交用户可见的 Skill 名称；服务端以本轮权威 Skill 目录重新解析
+        子任务类型及 Artifact 契约，防止用户伪造输入输出能力或绕过权限校验。
+        """
+
+        return await self.create_agent(
+            self._business_agent_definition(
+                value,
+                self._generated_key("custom_agent"),
+                available_skills,
+            )
+        )
+
+    def _business_agent_definition(
+        self,
+        value: BusinessAgentDraftInput,
+        agent_key: str,
+        available_skills: Sequence[AvailableSkillOption],
+    ) -> CustomAgentDefinitionInput:
+        """依据已发布 Skill 目录编译业务 Agent 的受控能力和权限定义。"""
+
+        options_by_name = {item.name: item for item in available_skills}
+        missing = sorted(set(value.allowed_skill_names) - set(options_by_name))
+        if missing:
+            raise CustomExtensionValidationError(
+                f"选择的 Skill 不存在、未发布或当前不可授权：{missing}"
+            )
+        selected = [options_by_name[name] for name in value.allowed_skill_names]
+        accepted_subtasks = self._stable_unique(
+            [item for option in selected for item in option.supported_subtask_types]
+        )
+        accepted_inputs = self._stable_unique(
+            [item for option in selected for item in option.input_artifact_types]
+        )
+        produced_outputs = self._stable_unique(
+            [item for option in selected for item in option.output_artifact_types]
+        )
+        instruction = "\n".join(
+            [
+                f"你是用户定义的专业 Agent：{value.name}。",
+                f"职责：{value.responsibility}",
+                f"适用场景：{value.applicable_scenarios}",
+                f"典型用户请求：{value.example_request}",
+                "只认领与上述职责匹配、且输入条件已经满足的子任务。",
+                "只从 permissions.yaml 授权的 Skill 中选择能力；不得构建、审核或发布本体和图谱。",
+                "必须使用 Skill 产生的标准 Artifact 交付结果，不得把自由文本作为正式业务产物。",
+            ]
+        )
+        return CustomAgentDefinitionInput(
+            agent_key=agent_key,
+            name=value.name,
+            description=value.responsibility,
+            accepted_subtask_types=accepted_subtasks,
+            accepted_input_types=accepted_inputs,
+            produced_output_types=produced_outputs,
+            instruction_markdown=instruction,
+            allowed_skill_names=value.allowed_skill_names,
+            routing_examples=[
+                {
+                    "scenario": value.applicable_scenarios,
+                    "request": value.example_request,
+                }
+            ],
+        )
+
+    async def update_business_agent(
+        self,
+        agent_id: UUID,
+        value: BusinessAgentDraftInput,
+        *,
+        available_skills: Sequence[AvailableSkillOption],
+    ) -> CustomAgentDetail:
+        """以业务职责和多选权限生成 Agent 新草稿，不改变稳定运行标识。"""
+
+        async with self._session_factory() as session:
+            agent = await session.get(CustomAgentRow, agent_id)
+            if agent is None:
+                raise CustomExtensionValidationError("自定义 Agent 不存在")
+            agent_key = agent.agent_key
+        return await self.update_agent(
+            agent_id,
+            self._business_agent_definition(value, agent_key, available_skills),
+        )
+
+    async def update_skill(
+        self, skill_id: UUID, value: CustomSkillDefinitionInput
+    ) -> CustomSkillDetail:
+        """以新草稿修订更新 Skill，绝不覆盖历史已发布内容。"""
+
+        self._validate_skill_artifacts(value)
+        now = self._now()
+        metadata, markdown = render_skill_markdown(value)
+        checksum = checksum_for(markdown, stable_json(metadata), "SKILL_DEFINITION_V1")
+        async with self._session_factory() as session, session.begin():
+            skill = await session.get(CustomSkillRow, skill_id, with_for_update=True)
+            if skill is None:
+                raise CustomExtensionValidationError("自定义 Skill 不存在")
+            if skill.skill_key != value.skill_key:
+                raise CustomExtensionValidationError("已创建的 Skill 不允许修改 skill_key")
+            # 编辑活动版本不会影响正在使用的发布指针；停用项也允许先修订再重新发布，
+            # 让“下线—调整—恢复”成为完整且可逆的用户操作。
+            source = await self._draft_skill_revision(session, skill_id)
+            if source is None:
+                source = await self._skill_revision_by_id(session, skill.current_revision_id)
+            await self._supersede_draft_skill_revision(session, skill_id)
+            revision_number = await self._next_skill_revision_number(session, skill_id)
+            revision_id = uuid4()
+            session.add(
+                CustomSkillRevisionRow(
+                    revision_id=revision_id,
+                    skill_id=skill_id,
+                    revision_number=revision_number,
+                    metadata_json=metadata,
+                    skill_markdown=markdown,
+                    entrypoint=None,
+                    status="DRAFT",
+                    checksum=checksum,
+                    created_at=now,
+                    published_at=None,
+                )
+            )
+            # 新草稿默认复制上一可编辑/已发布版本的资源。编辑业务描述时脚本和参考资料
+            # 不能静默丢失；用户随后上传同路径文件时可在草稿内替换。
+            if source is not None:
+                resources = list(
+                    await session.scalars(
+                        select(CustomSkillResourceRow).where(
+                            CustomSkillResourceRow.skill_revision_id == source.revision_id
+                        )
+                    )
+                )
+                for item in resources:
+                    if (
+                        item.relative_path == GENERATED_ENTRYPOINT
+                        and value.generated_script_entrypoint is None
+                    ):
+                        continue
+                    session.add(
+                        CustomSkillResourceRow(
+                            resource_id=uuid4(),
+                            skill_revision_id=revision_id,
+                            relative_path=item.relative_path,
+                            media_type=item.media_type,
+                            content=item.content,
+                            checksum=item.checksum,
+                            size_bytes=item.size_bytes,
+                            created_at=now,
+                        )
+                    )
+            skill.name, skill.description, skill.updated_at = value.name, value.description, now
+        return await self.get_skill(skill_id, include_definition=True)
+
+    async def add_skill_resource(
+        self,
+        skill_id: UUID,
+        *,
+        relative_path: str,
+        media_type: str,
+        content: bytes,
+        system_generated: bool = False,
+    ) -> CustomResourceSummary:
+        """将资源绑定到当前草稿修订；已发布修订的资源从不原地修改。"""
+
+        path = self._validate_resource_path(relative_path)
+        if path == GENERATED_ENTRYPOINT and not system_generated:
+            raise CustomExtensionValidationError(
+                "_kg_skill_entry.py 是平台保留入口，不能由用户上传"
+            )
+        if not content:
+            raise CustomExtensionValidationError("Skill 资源不能为空")
+        if len(content) > _MAX_CUSTOM_RESOURCE_BYTES:
+            raise CustomExtensionValidationError("单个 Skill 资源不能超过 2 MiB")
+        now = self._now()
+        async with self._session_factory() as session, session.begin():
+            skill = await session.get(CustomSkillRow, skill_id, with_for_update=True)
+            if skill is None:
+                raise CustomExtensionValidationError("自定义 Skill 不存在")
+            draft = await self._require_draft_skill_revision(session, skill_id)
+            existing = await session.scalar(
+                select(CustomSkillResourceRow).where(
+                    CustomSkillResourceRow.skill_revision_id == draft.revision_id,
+                    CustomSkillResourceRow.relative_path == path,
+                )
+            )
+            if existing is not None:
+                # 草稿从上一修订复制资源后，允许用户以相同路径上传新文件覆盖它；已发布
+                # 修订保持不可变，替换仅发生在尚未发布的草稿中。
+                existing.media_type = media_type or "application/octet-stream"
+                existing.content = content
+                existing.checksum = checksum_for(content)
+                existing.size_bytes = len(content)
+                existing.created_at = now
+                skill.updated_at = now
+                return self._resource_summary(existing)
+            resource = CustomSkillResourceRow(
+                resource_id=uuid4(),
+                skill_revision_id=draft.revision_id,
+                relative_path=path,
+                media_type=media_type or "application/octet-stream",
+                content=content,
+                checksum=checksum_for(content),
+                size_bytes=len(content),
+                created_at=now,
+            )
+            session.add(resource)
+            skill.updated_at = now
+        return self._resource_summary(resource)
+
+    async def publish_skill(self, skill_id: UUID) -> CustomSkillDetail:
+        """静态校验当前草稿后发布，并原子切换运行期发现指针。"""
+
+        now = self._now()
+        async with self._session_factory() as session, session.begin():
+            skill = await session.get(CustomSkillRow, skill_id, with_for_update=True)
+            if skill is None:
+                raise CustomExtensionValidationError("自定义 Skill 不存在")
+            draft = await self._require_draft_skill_revision(session, skill_id)
+            resource_rows = list(
+                await session.scalars(
+                    select(CustomSkillResourceRow)
+                    .where(CustomSkillResourceRow.skill_revision_id == draft.revision_id)
+                    .order_by(CustomSkillResourceRow.relative_path)
+                )
+            )
+            if len(resource_rows) > _MAX_CUSTOM_RESOURCES:
+                raise CustomExtensionValidationError("一个 Skill 修订最多包含 30 个资源")
+            if sum(item.size_bytes for item in resource_rows) > _MAX_CUSTOM_RESOURCE_TOTAL_BYTES:
+                raise CustomExtensionValidationError("一个 Skill 修订的资源总量不能超过 8 MiB")
+            # 资源上传结束后才判断：无 .py 由模型执行，有 .py 则固定到脚本执行器。
+            # 多脚本包必须明确上传 main.py，避免按文件名排序猜测入口。
+            entrypoint = self._resolve_script_entrypoint(
+                [item.relative_path for item in resource_rows], draft.metadata_json
+            )
+            self._validate_python_resources(resource_rows)
+            if entrypoint is None and draft.metadata_json.get("script_input_bindings"):
+                raise CustomExtensionValidationError("没有 Python 脚本时不能发布脚本输入字段映射")
+            if entrypoint is not None:
+                profile = self._contract_profile_for_revision(draft)
+                bundle_checksum = self._script_bundle_checksum(draft, entrypoint, resource_rows)
+                passed_check = await session.scalar(
+                    select(CustomSkillContractCheckRow)
+                    .where(
+                        CustomSkillContractCheckRow.skill_revision_id == draft.revision_id,
+                        CustomSkillContractCheckRow.contract_profile_id == profile.profile_id,
+                        CustomSkillContractCheckRow.bundle_checksum == bundle_checksum,
+                        CustomSkillContractCheckRow.runtime_profile_id == SCRIPT_RUNTIME_PROFILE_ID,
+                        CustomSkillContractCheckRow.protocol_version == SCRIPT_PROTOCOL_VERSION,
+                        CustomSkillContractCheckRow.status == "PASSED",
+                    )
+                    .order_by(CustomSkillContractCheckRow.checked_at.desc())
+                )
+                if passed_check is None:
+                    raise CustomExtensionValidationError(
+                        "脚本草稿尚未通过当前资源和契约的沙箱试运行，请先执行契约检查"
+                    )
+            draft.entrypoint = entrypoint
+            # 是否带 Python 资源只影响运行器绑定，不属于 Skill 的业务元数据。
+            draft.metadata_json = {
+                key: value
+                for key, value in draft.metadata_json.items()
+                if key not in {"implementation", "entrypoint"}
+            }
+            body = self._markdown_body(draft.skill_markdown)
+            front_matter = yaml.safe_dump(
+                draft.metadata_json, allow_unicode=True, sort_keys=False
+            ).strip()
+            draft.skill_markdown = f"---\n{front_matter}\n---\n\n{body.strip()}\n"
+            # 发布 checksum 同时绑定正文、元数据和资源版本。未来 Sandbox Runner 能据此
+            # 确认实际暂存的脚本或参考资料就是用户审核后发布的定义包内容。
+            draft.checksum = checksum_for(
+                draft.skill_markdown,
+                stable_json(draft.metadata_json),
+                "SKILL_DEFINITION_V1",
+                stable_json(
+                    [
+                        {
+                            "relative_path": item.relative_path,
+                            "checksum": item.checksum,
+                            "size_bytes": item.size_bytes,
+                        }
+                        for item in resource_rows
+                    ]
+                ),
+            )
+            draft.status, draft.published_at = "PUBLISHED", now
+            skill.current_revision_id = draft.revision_id
+            skill.status = "ACTIVE"
+            skill.updated_at = now
+        return await self.get_skill(skill_id, include_definition=True)
+
+    async def disable_skill(self, skill_id: UUID) -> CustomSkillDetail:
+        """停用 Skill 的运行期发现资格，但保留所有修订以支持历史追溯。"""
+
+        async with self._session_factory() as session, session.begin():
+            skill = await session.get(CustomSkillRow, skill_id, with_for_update=True)
+            if skill is None:
+                raise CustomExtensionValidationError("自定义 Skill 不存在")
+            await self._ensure_skill_not_used_by_active_agents(session, skill.skill_key)
+            skill.status, skill.updated_at = "DISABLED", self._now()
+        return await self.get_skill(skill_id, include_definition=True)
+
+    async def enable_skill(self, skill_id: UUID) -> CustomSkillDetail:
+        """恢复未修改的已发布 Skill；存在草稿时必须发布草稿而非丢弃用户修改。"""
+
+        async with self._session_factory() as session, session.begin():
+            skill = await session.get(CustomSkillRow, skill_id, with_for_update=True)
+            if skill is None:
+                raise CustomExtensionValidationError("自定义 Skill 不存在")
+            if skill.status != "DISABLED":
+                raise CustomExtensionValidationError("只有已停用的 Skill 可以重新启用")
+            if await self._draft_skill_revision(session, skill_id) is not None:
+                raise CustomExtensionValidationError("存在待发布草稿；请发布草稿以启用新版本")
+            current = await self._skill_revision_by_id(session, skill.current_revision_id)
+            if current is None or current.status != "PUBLISHED":
+                raise CustomExtensionValidationError("没有可恢复的已发布 Skill 版本")
+            skill.status, skill.updated_at = "ACTIVE", self._now()
+        return await self.get_skill(skill_id, include_definition=True)
+
+    async def delete_skill(self, skill_id: UUID) -> None:
+        """物理删除已停用 Skill 的定义包，不删除历史任务快照与 Artifact。
+
+        删除是管理定义包的不可逆操作，而不是运行期状态切换。因此只允许删除已经
+        ``DISABLED`` 的 Skill，并在删除前再次确认没有活动自定义 Agent 的权限 YAML
+        正在引用它。任务、执行日志和产物只保存运行时快照或 Skill key，并不以该定义
+        包为外键；它们会保留以支持历史审计。
+        """
+
+        async with self._session_factory() as session, session.begin():
+            skill = await session.get(CustomSkillRow, skill_id, with_for_update=True)
+            if skill is None:
+                raise CustomExtensionValidationError("自定义 Skill 不存在")
+            if skill.status != "DISABLED":
+                raise CustomExtensionValidationError("只能删除已停用的 Skill，请先停用")
+            await self._ensure_skill_not_used_by_active_agents(session, skill.skill_key)
+
+            # revision 与身份记录间没有数据库级级联，须先删除子记录；resource 对
+            # revision 有 CASCADE，但显式删除便于所有数据库方言保持一致的行为。
+            revision_ids = list(
+                await session.scalars(
+                    select(CustomSkillRevisionRow.revision_id).where(
+                        CustomSkillRevisionRow.skill_id == skill_id
+                    )
+                )
+            )
+            if revision_ids:
+                await session.execute(
+                    delete(CustomSkillContractCheckRow).where(
+                        CustomSkillContractCheckRow.skill_revision_id.in_(revision_ids)
+                    )
+                )
+                await session.execute(
+                    delete(CustomSkillResourceRow).where(
+                        CustomSkillResourceRow.skill_revision_id.in_(revision_ids)
+                    )
+                )
+            await session.execute(
+                delete(CustomSkillRevisionRow).where(CustomSkillRevisionRow.skill_id == skill_id)
+            )
+            await session.delete(skill)
+
+    async def create_agent(self, value: CustomAgentDefinitionInput) -> CustomAgentDetail:
+        """新建稳定 Agent 身份与首个职责、权限草稿修订。"""
+
+        self._validate_agent_artifacts(value)
+        now = self._now()
+        metadata, markdown, permissions = render_agent_markdown(value)
+        checksum = checksum_for(markdown, permissions, stable_json(value.routing_examples))
+        agent_id, revision_id = uuid4(), uuid4()
+        async with self._session_factory() as session, session.begin():
+            existing = await session.scalar(
+                select(CustomAgentRow).where(CustomAgentRow.agent_key == value.agent_key)
+            )
+            if existing is not None:
+                raise CustomExtensionValidationError(f"Agent 标识已存在：{value.agent_key}")
+            # 与 Skill 身份相同，显式先写 Agent 父记录，避免 PostgreSQL 的外键插入顺序
+            # 依赖未声明 relationship 的 ORM flush 排序。
+            session.add(
+                CustomAgentRow(
+                    agent_id=agent_id,
+                    agent_key=value.agent_key,
+                    name=value.name,
+                    description=value.description,
+                    current_revision_id=None,
+                    status="DRAFT",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            await session.flush()
+            session.add(
+                CustomAgentRevisionRow(
+                    revision_id=revision_id,
+                    agent_id=agent_id,
+                    revision_number=1,
+                    metadata_json=metadata,
+                    agent_markdown=markdown,
+                    permissions_yaml=permissions,
+                    routing_examples={"examples": value.routing_examples},
+                    status="DRAFT",
+                    checksum=checksum,
+                    created_at=now,
+                    published_at=None,
+                )
+            )
+        return await self.get_agent(agent_id, include_definition=True)
+
+    async def update_agent(
+        self, agent_id: UUID, value: CustomAgentDefinitionInput
+    ) -> CustomAgentDetail:
+        """以新草稿修订更新 Agent 职责或唯一的 Skill 权限 YAML。"""
+
+        self._validate_agent_artifacts(value)
+        now = self._now()
+        metadata, markdown, permissions = render_agent_markdown(value)
+        checksum = checksum_for(markdown, permissions, stable_json(value.routing_examples))
+        async with self._session_factory() as session, session.begin():
+            agent = await session.get(CustomAgentRow, agent_id, with_for_update=True)
+            if agent is None:
+                raise CustomExtensionValidationError("自定义 Agent 不存在")
+            if agent.agent_key != value.agent_key:
+                raise CustomExtensionValidationError("已创建的 Agent 不允许修改 agent_key")
+            await self._supersede_draft_agent_revision(session, agent_id)
+            revision_number = await self._next_agent_revision_number(session, agent_id)
+            session.add(
+                CustomAgentRevisionRow(
+                    revision_id=uuid4(),
+                    agent_id=agent_id,
+                    revision_number=revision_number,
+                    metadata_json=metadata,
+                    agent_markdown=markdown,
+                    permissions_yaml=permissions,
+                    routing_examples={"examples": value.routing_examples},
+                    status="DRAFT",
+                    checksum=checksum,
+                    created_at=now,
+                    published_at=None,
+                )
+            )
+            agent.name, agent.description, agent.updated_at = value.name, value.description, now
+        return await self.get_agent(agent_id, include_definition=True)
+
+    async def publish_agent(self, agent_id: UUID) -> CustomAgentDetail:
+        """确认所有允许的 Skill 已可发现后发布 Agent 的草稿修订。"""
+
+        now = self._now()
+        async with self._session_factory() as session, session.begin():
+            agent = await session.get(CustomAgentRow, agent_id, with_for_update=True)
+            if agent is None:
+                raise CustomExtensionValidationError("自定义 Agent 不存在")
+            draft = await self._require_draft_agent_revision(session, agent_id)
+            allowed = self._allowed_skills_from_permissions(draft.permissions_yaml)
+            await self._validate_published_agent_skills(session, allowed)
+            draft.status, draft.published_at = "PUBLISHED", now
+            agent.current_revision_id = draft.revision_id
+            agent.status = "ACTIVE"
+            agent.updated_at = now
+        return await self.get_agent(agent_id, include_definition=True)
+
+    async def disable_agent(self, agent_id: UUID) -> CustomAgentDetail:
+        """停用 Agent 的动态发现资格，保留历史任务所引用的修订。"""
+
+        async with self._session_factory() as session, session.begin():
+            agent = await session.get(CustomAgentRow, agent_id, with_for_update=True)
+            if agent is None:
+                raise CustomExtensionValidationError("自定义 Agent 不存在")
+            agent.status, agent.updated_at = "DISABLED", self._now()
+        return await self.get_agent(agent_id, include_definition=True)
+
+    async def enable_agent(self, agent_id: UUID) -> CustomAgentDetail:
+        """恢复未修改的已发布 Agent；草稿存在时只允许以发布草稿的方式恢复。"""
+
+        async with self._session_factory() as session, session.begin():
+            agent = await session.get(CustomAgentRow, agent_id, with_for_update=True)
+            if agent is None:
+                raise CustomExtensionValidationError("自定义 Agent 不存在")
+            if agent.status != "DISABLED":
+                raise CustomExtensionValidationError("只有已停用的 Agent 可以重新启用")
+            if await self._draft_agent_revision(session, agent_id) is not None:
+                raise CustomExtensionValidationError("存在待发布草稿；请发布草稿以启用新版本")
+            current = await self._agent_revision_by_id(session, agent.current_revision_id)
+            if current is None or current.status != "PUBLISHED":
+                raise CustomExtensionValidationError("没有可恢复的已发布 Agent 版本")
+            agent.status, agent.updated_at = "ACTIVE", self._now()
+        return await self.get_agent(agent_id, include_definition=True)
+
+    async def delete_agent(self, agent_id: UUID) -> None:
+        """物理删除已停用 Agent 的定义与权限修订，保留历史执行记录。
+
+        已停用 Agent 不会进入新的总控候选列表，因而删除不会影响仍在执行的任务。
+        历史 Assignment、AgentRunResult 与 ExecutionTrace 保留其当时的 Agent key、
+        决策及 Artifact 引用，不依赖本定义包的数据库外键。
+        """
+
+        async with self._session_factory() as session, session.begin():
+            agent = await session.get(CustomAgentRow, agent_id, with_for_update=True)
+            if agent is None:
+                raise CustomExtensionValidationError("自定义 Agent 不存在")
+            if agent.status != "DISABLED":
+                raise CustomExtensionValidationError("只能删除已停用的 Agent，请先停用")
+            await session.execute(
+                delete(CustomAgentRevisionRow).where(CustomAgentRevisionRow.agent_id == agent_id)
+            )
+            await session.delete(agent)
+
+    async def list_skills(self) -> list[CustomSkillDetail]:
+        """列出稳定 Skill 身份及当前/草稿摘要，不返回正文或资源内容。"""
+
+        async with self._session_factory() as session:
+            rows = list(
+                await session.scalars(
+                    select(CustomSkillRow).order_by(CustomSkillRow.updated_at.desc())
+                )
+            )
+            return [
+                await self._skill_detail(session, row, include_definition=False) for row in rows
+            ]
+
+    async def get_skill(self, skill_id: UUID, *, include_definition: bool) -> CustomSkillDetail:
+        """读取指定 Skill；不存在时返回面向 API 的明确业务错误。"""
+
+        async with self._session_factory() as session:
+            row = await session.get(CustomSkillRow, skill_id)
+            if row is None:
+                raise CustomExtensionValidationError("自定义 Skill 不存在")
+            return await self._skill_detail(session, row, include_definition=include_definition)
+
+    async def list_agents(self) -> list[CustomAgentDetail]:
+        """列出稳定 Agent 身份及修订摘要，不默认暴露 Prompt 正文。"""
+
+        async with self._session_factory() as session:
+            rows = list(
+                await session.scalars(
+                    select(CustomAgentRow).order_by(CustomAgentRow.updated_at.desc())
+                )
+            )
+            return [
+                await self._agent_detail(session, row, include_definition=False) for row in rows
+            ]
+
+    async def list_active_skill_options(
+        self, builtin_skills: Sequence[SkillRegistration]
+    ) -> list[AvailableSkillOption]:
+        """合并内置与已发布自定义 Skill，供 Agent 权限多选框展示。"""
+
+        options = [
+            AvailableSkillOption(
+                name=item.name,
+                display_name=item.display_name or item.name,
+                description=item.description,
+                source="BUILTIN",
+                supported_subtask_types=item.supported_subtask_types,
+                input_artifact_types=item.input_artifact_types,
+                output_artifact_types=item.output_artifact_types,
+            )
+            for item in builtin_skills
+            if item.lifecycle == "ACTIVE"
+        ]
+        async with self._session_factory() as session:
+            rows = list(
+                await session.scalars(
+                    select(CustomSkillRow)
+                    .where(
+                        CustomSkillRow.status == "ACTIVE",
+                        CustomSkillRow.current_revision_id.is_not(None),
+                    )
+                    .order_by(CustomSkillRow.skill_key)
+                )
+            )
+            for row in rows:
+                revision = await self._skill_revision_by_id(session, row.current_revision_id)
+                if revision is None or revision.status != "PUBLISHED":
+                    continue
+                metadata = revision.metadata_json
+                options.append(
+                    AvailableSkillOption(
+                        name=row.skill_key,
+                        display_name=row.name,
+                        description=row.description,
+                        source="CUSTOM",
+                        supported_subtask_types=metadata["supported_subtask_types"],
+                        input_artifact_types=metadata["input_artifact_types"],
+                        output_artifact_types=metadata["output_artifact_types"],
+                    )
+                )
+        return sorted(options, key=lambda item: (item.source, item.name))
+
+    async def load_script_bundle(
+        self, skill_key: str, revision_number: int | None = None
+    ) -> ScriptBundle:
+        """按固定修订读取 SCRIPT 入口和资源，避免任务中途切换到更新的脚本。"""
+
+        async with self._session_factory() as session:
+            skill = await session.scalar(
+                select(CustomSkillRow).where(CustomSkillRow.skill_key == skill_key)
+            )
+            if skill is None:
+                raise CustomExtensionValidationError("SCRIPT Skill 不存在")
+            if revision_number is None:
+                revision = await self._draft_skill_revision(session, skill.skill_id)
+            else:
+                revision = await session.scalar(
+                    select(CustomSkillRevisionRow).where(
+                        CustomSkillRevisionRow.skill_id == skill.skill_id,
+                        CustomSkillRevisionRow.revision_number == revision_number,
+                    )
+                )
+            if revision is None or revision.entrypoint is None:
+                raise CustomExtensionValidationError("Skill 没有可执行的 Python 资源")
+            if revision_number is not None and revision.status != "PUBLISHED":
+                raise CustomExtensionValidationError("SCRIPT Skill 修订尚未发布")
+            resources = list(
+                await session.scalars(
+                    select(CustomSkillResourceRow).where(
+                        CustomSkillResourceRow.skill_revision_id == revision.revision_id
+                    )
+                )
+            )
+            if not revision.entrypoint or revision.entrypoint not in {
+                item.relative_path for item in resources
+            }:
+                raise CustomExtensionValidationError("SCRIPT Skill 入口资源不存在")
+            return ScriptBundle(
+                entrypoint=revision.entrypoint,
+                checksum=revision.checksum,
+                resources=tuple((item.relative_path, item.content) for item in resources),
+                input_bindings=tuple(
+                    ScriptInputFieldBinding.model_validate(item)
+                    for item in revision.metadata_json.get("script_input_bindings", [])
+                ),
+                output_bindings=tuple(
+                    ScriptOutputFieldBinding.model_validate(item)
+                    for item in revision.metadata_json.get("script_output_bindings", [])
+                ),
+                entity_record_adapter=(
+                    EntityRecordAdapter.model_validate(
+                        revision.metadata_json["entity_record_adapter"]
+                    )
+                    if revision.metadata_json.get("entity_record_adapter")
+                    and revision.entrypoint != GENERATED_ENTRYPOINT
+                    else None
+                ),
+            )
+
+    async def load_active_registrations(
+        self,
+    ) -> tuple[list[AgentRegistration], list[tuple[SkillRegistration, str, bool]]]:
+        """加载当前已发布定义，供运行期 Composite Registry 合并。
+
+        返回的 Skill 元数据反向授权列表完全由已发布 Agent 的 permissions.yaml 临时
+        推导。未被任何已发布 Agent 授权的自定义 Skill 可以保留为资产，但不会被发现。
+        """
+
+        async with self._session_factory() as session:
+            agent_rows = list(
+                await session.scalars(
+                    select(CustomAgentRow)
+                    .where(
+                        CustomAgentRow.status == "ACTIVE",
+                        CustomAgentRow.current_revision_id.is_not(None),
+                    )
+                    .order_by(CustomAgentRow.agent_key)
+                )
+            )
+            agents: list[AgentRegistration] = []
+            allowed_by_skill: dict[str, list[str]] = {}
+            for row in agent_rows:
+                revision = await self._agent_revision_by_id(session, row.current_revision_id)
+                if revision is None or revision.status != "PUBLISHED":
+                    continue
+                allowed = self._allowed_skills_from_permissions(revision.permissions_yaml)
+                agents.append(
+                    AgentRegistration.model_validate(
+                        {
+                            **revision.metadata_json,
+                            # 历史 revision 可能创建于 display_name 字段引入前；运行期
+                            # 投影以稳定身份表中的用户名称补齐，不修改不可变历史 revision。
+                            "name": row.name,
+                            "display_name": row.name,
+                            "version": f"custom-{revision.revision_number}",
+                            "allowed_skills": allowed,
+                            "can_publish_subtasks": False,
+                            "can_publish_ontology": False,
+                            "can_publish_graph": False,
+                            "instruction_markdown": self._markdown_body(revision.agent_markdown),
+                        }
+                    )
+                )
+                for skill_name in allowed:
+                    allowed_by_skill.setdefault(skill_name, []).append(row.agent_key)
+
+            skill_rows = list(
+                await session.scalars(
+                    select(CustomSkillRow)
+                    .where(
+                        CustomSkillRow.status == "ACTIVE",
+                        CustomSkillRow.current_revision_id.is_not(None),
+                    )
+                    .order_by(CustomSkillRow.skill_key)
+                )
+            )
+            skills: list[tuple[SkillRegistration, str, bool]] = []
+            for skill_row in skill_rows:
+                skill_revision = await self._skill_revision_by_id(
+                    session, skill_row.current_revision_id
+                )
+                allowed_agents = sorted(set(allowed_by_skill.get(skill_row.skill_key, [])))
+                if (
+                    skill_revision is None
+                    or skill_revision.status != "PUBLISHED"
+                    or not allowed_agents
+                ):
+                    continue
+                skills.append(
+                    (
+                        SkillRegistration.model_validate(
+                            {
+                                **skill_revision.metadata_json,
+                                "name": skill_row.skill_key,
+                                # Skill 的 name 必须保持内部 key，显示名另行传递，既让模型
+                                # 理解业务能力，也不影响 permissions.yaml 与调用校验。
+                                "display_name": skill_row.name,
+                                "version": f"custom-{skill_revision.revision_number}",
+                                "owner_agent": None,
+                                "allowed_agents": allowed_agents,
+                                "lifecycle": "ACTIVE",
+                            }
+                        ),
+                        self._markdown_body(skill_revision.skill_markdown),
+                        skill_revision.entrypoint is not None,
+                    )
+                )
+            return agents, skills
+
+    async def get_agent(self, agent_id: UUID, *, include_definition: bool) -> CustomAgentDetail:
+        """读取指定 Agent 的当前定义和草稿状态。"""
+
+        async with self._session_factory() as session:
+            row = await session.get(CustomAgentRow, agent_id)
+            if row is None:
+                raise CustomExtensionValidationError("自定义 Agent 不存在")
+            return await self._agent_detail(session, row, include_definition=include_definition)
+
+    @staticmethod
+    def _markdown_body(markdown: str) -> str:
+        """剥离受控 front matter，仅把定义正文提供给对应运行时 Prompt。"""
+
+        if markdown.startswith("---\n"):
+            parts = markdown.split("---", maxsplit=2)
+            if len(parts) == 3:
+                return parts[2].strip()
+        return markdown.strip()
+
+    async def _skill_detail(
+        self, session: AsyncSession, row: CustomSkillRow, *, include_definition: bool
+    ) -> CustomSkillDetail:
+        """聚合 Skill 身份、发布指针和可选的当前优先定义内容。"""
+
+        current = await self._skill_revision_by_id(session, row.current_revision_id)
+        draft = await self._draft_skill_revision(session, row.skill_id)
+        selected = draft or current
+        resources: list[dict[str, Any]] = []
+        latest_contract_check: CustomSkillContractCheck | None = None
+        if selected is not None:
+            check_row = await session.scalar(
+                select(CustomSkillContractCheckRow)
+                .where(CustomSkillContractCheckRow.skill_revision_id == selected.revision_id)
+                .order_by(CustomSkillContractCheckRow.checked_at.desc())
+            )
+            if check_row is not None:
+                latest_contract_check = self._contract_check_detail(check_row)
+        if selected is not None:
+            resource_rows = list(
+                await session.scalars(
+                    select(CustomSkillResourceRow)
+                    .where(CustomSkillResourceRow.skill_revision_id == selected.revision_id)
+                    .order_by(CustomSkillResourceRow.relative_path)
+                )
+            )
+            resources = [
+                self._resource_summary(item).model_dump(mode="json") for item in resource_rows
+            ]
+        return CustomSkillDetail(
+            skill_id=row.skill_id,
+            skill_key=row.skill_key,
+            name=row.name,
+            description=row.description,
+            status=row.status,  # type: ignore[arg-type]
+            current_revision_id=row.current_revision_id,
+            current_revision=self._skill_revision_summary(current),
+            draft_revision=self._skill_revision_summary(draft),
+            metadata=selected.metadata_json if include_definition and selected else None,
+            skill_markdown=selected.skill_markdown if include_definition and selected else None,
+            resources=resources,
+            latest_contract_check=latest_contract_check,
+            created_at=row.created_at,
+            updated_at=row.updated_at,
+        )
+
+    async def _agent_detail(
+        self, session: AsyncSession, row: CustomAgentRow, *, include_definition: bool
+    ) -> CustomAgentDetail:
+        """聚合 Agent 身份、修订和由 YAML 生成的授权信息。"""
+
+        current = await self._agent_revision_by_id(session, row.current_revision_id)
+        draft = await self._draft_agent_revision(session, row.agent_id)
+        selected = draft or current
+        examples = selected.routing_examples.get("examples", []) if selected else []
+        return CustomAgentDetail(
+            agent_id=row.agent_id,
+            agent_key=row.agent_key,
+            name=row.name,
+            description=row.description,
+            status=row.status,  # type: ignore[arg-type]
+            current_revision_id=row.current_revision_id,
+            current_revision=self._agent_revision_summary(current),
+            draft_revision=self._agent_revision_summary(draft),
+            metadata=selected.metadata_json if include_definition and selected else None,
+            agent_markdown=selected.agent_markdown if include_definition and selected else None,
+            permissions_yaml=selected.permissions_yaml if include_definition and selected else None,
+            routing_examples=examples if include_definition else [],
+            created_at=row.created_at,
+            updated_at=row.updated_at,
+        )
+
+    async def _validate_published_agent_skills(
+        self, session: AsyncSession, allowed_skill_names: list[str]
+    ) -> None:
+        """发布 Agent 前验证其 YAML 中每个 Skill 已由内置或已发布自定义 Skill 提供。"""
+
+        unknown = set(allowed_skill_names) - self._builtin_skill_keys
+        if not unknown:
+            return
+        active_rows = list(
+            await session.scalars(
+                select(CustomSkillRow).where(
+                    CustomSkillRow.skill_key.in_(unknown), CustomSkillRow.status == "ACTIVE"
+                )
+            )
+        )
+        found = {row.skill_key for row in active_rows if row.current_revision_id is not None}
+        missing = sorted(unknown - found)
+        if missing:
+            raise CustomExtensionValidationError(
+                f"Agent permissions.yaml 引用了未发布或不存在的 Skill：{missing}"
+            )
+
+    async def _ensure_skill_not_used_by_active_agents(
+        self, session: AsyncSession, skill_key: str
+    ) -> None:
+        """阻止停用仍被已发布 Agent YAML 引用的 Skill，避免动态快照失效。"""
+
+        agent_rows = list(
+            await session.scalars(
+                select(CustomAgentRow).where(
+                    CustomAgentRow.status == "ACTIVE",
+                    CustomAgentRow.current_revision_id.is_not(None),
+                )
+            )
+        )
+        users: list[str] = []
+        for agent_row in agent_rows:
+            revision = await self._agent_revision_by_id(session, agent_row.current_revision_id)
+            if revision is not None and skill_key in self._allowed_skills_from_permissions(
+                revision.permissions_yaml
+            ):
+                users.append(agent_row.agent_key)
+        if users:
+            raise CustomExtensionValidationError(
+                f"Skill 仍被已发布 Agent 引用：{sorted(users)}；请先更新或停用这些 Agent"
+            )
+
+    @staticmethod
+    def _allowed_skills_from_permissions(permissions_yaml: str) -> list[str]:
+        """解析服务自己生成的 YAML；出现非法形状时拒绝发布而非猜测权限。"""
+
+        import yaml
+
+        try:
+            payload = yaml.safe_load(permissions_yaml)
+        except yaml.YAMLError as exc:
+            raise CustomExtensionValidationError("Agent permissions.yaml 无法解析") from exc
+        skills = payload.get("allowed_skills") if isinstance(payload, dict) else None
+        if not isinstance(skills, list) or not all(isinstance(item, str) for item in skills):
+            raise CustomExtensionValidationError(
+                "Agent permissions.yaml 必须包含字符串 allowed_skills"
+            )
+        if _PUBLISH_SKILLS.intersection(skills):
+            raise CustomExtensionValidationError("自定义 Agent 不允许获得发布 Skill 权限")
+        return skills
+
+    @staticmethod
+    async def _next_skill_revision_number(session: AsyncSession, skill_id: UUID) -> int:
+        """在已加锁的稳定定义下生成下一个单调递增修订号。"""
+
+        rows = list(
+            await session.scalars(
+                select(CustomSkillRevisionRow.revision_number).where(
+                    CustomSkillRevisionRow.skill_id == skill_id
+                )
+            )
+        )
+        return max(rows, default=0) + 1
+
+    @staticmethod
+    async def _next_agent_revision_number(session: AsyncSession, agent_id: UUID) -> int:
+        """在已加锁的稳定 Agent 下生成下一个不可变修订号。"""
+
+        rows = list(
+            await session.scalars(
+                select(CustomAgentRevisionRow.revision_number).where(
+                    CustomAgentRevisionRow.agent_id == agent_id
+                )
+            )
+        )
+        return max(rows, default=0) + 1
+
+    @staticmethod
+    async def _supersede_draft_skill_revision(session: AsyncSession, skill_id: UUID) -> None:
+        """将旧草稿标成 SUPERSEDED，确保每个 Skill 同时至多一个可编辑草稿。"""
+
+        draft = await session.scalar(
+            select(CustomSkillRevisionRow).where(
+                CustomSkillRevisionRow.skill_id == skill_id,
+                CustomSkillRevisionRow.status == "DRAFT",
+            )
+        )
+        if draft is not None:
+            draft.status = "SUPERSEDED"
+
+    @staticmethod
+    async def _supersede_draft_agent_revision(session: AsyncSession, agent_id: UUID) -> None:
+        """将旧 Agent 草稿冻结为 SUPERSEDED，避免权限来源出现两个候选版本。"""
+
+        draft = await session.scalar(
+            select(CustomAgentRevisionRow).where(
+                CustomAgentRevisionRow.agent_id == agent_id,
+                CustomAgentRevisionRow.status == "DRAFT",
+            )
+        )
+        if draft is not None:
+            draft.status = "SUPERSEDED"
+
+    @staticmethod
+    async def _draft_skill_revision(
+        session: AsyncSession, skill_id: UUID
+    ) -> CustomSkillRevisionRow | None:
+        """返回唯一的当前草稿修订。"""
+
+        return cast(
+            CustomSkillRevisionRow | None,
+            await session.scalar(
+                select(CustomSkillRevisionRow)
+                .where(
+                    CustomSkillRevisionRow.skill_id == skill_id,
+                    CustomSkillRevisionRow.status == "DRAFT",
+                )
+                .order_by(CustomSkillRevisionRow.revision_number.desc())
+            ),
+        )
+
+    async def _require_draft_skill_revision(
+        self, session: AsyncSession, skill_id: UUID
+    ) -> CustomSkillRevisionRow:
+        """返回可编辑 Skill 草稿；若没有草稿，明确要求先通过更新接口创建。"""
+
+        draft = await self._draft_skill_revision(session, skill_id)
+        if draft is None:
+            raise CustomExtensionValidationError("不存在可编辑草稿；请先提交一次 Skill 更新")
+        return draft
+
+    @staticmethod
+    async def _draft_agent_revision(
+        session: AsyncSession, agent_id: UUID
+    ) -> CustomAgentRevisionRow | None:
+        """返回当前唯一 Agent 草稿修订。"""
+
+        return cast(
+            CustomAgentRevisionRow | None,
+            await session.scalar(
+                select(CustomAgentRevisionRow)
+                .where(
+                    CustomAgentRevisionRow.agent_id == agent_id,
+                    CustomAgentRevisionRow.status == "DRAFT",
+                )
+                .order_by(CustomAgentRevisionRow.revision_number.desc())
+            ),
+        )
+
+    async def _require_draft_agent_revision(
+        self, session: AsyncSession, agent_id: UUID
+    ) -> CustomAgentRevisionRow:
+        """返回可发布 Agent 草稿，不允许跳过定义阶段直接发布。"""
+
+        draft = await self._draft_agent_revision(session, agent_id)
+        if draft is None:
+            raise CustomExtensionValidationError("不存在可编辑草稿；请先提交一次 Agent 更新")
+        return draft
+
+    @staticmethod
+    async def _skill_revision_by_id(
+        session: AsyncSession, revision_id: UUID | None
+    ) -> CustomSkillRevisionRow | None:
+        """按发布指针读取 Skill 修订，空指针表示尚未发布。"""
+
+        return await session.get(CustomSkillRevisionRow, revision_id) if revision_id else None
+
+    @staticmethod
+    async def _agent_revision_by_id(
+        session: AsyncSession, revision_id: UUID | None
+    ) -> CustomAgentRevisionRow | None:
+        """按发布指针读取 Agent 修订，空指针表示尚未发布。"""
+
+        return await session.get(CustomAgentRevisionRow, revision_id) if revision_id else None
+
+    @staticmethod
+    def _skill_revision_summary(row: CustomSkillRevisionRow | None) -> CustomRevisionSummary | None:
+        """压缩 ORM Skill 修订为稳定的 API 摘要。"""
+
+        if row is None:
+            return None
+        return CustomRevisionSummary(
+            revision_id=row.revision_id,
+            revision_number=row.revision_number,
+            status=row.status,  # type: ignore[arg-type]
+            checksum=row.checksum,
+            created_at=row.created_at,
+            published_at=row.published_at,
+        )
+
+    @staticmethod
+    def _agent_revision_summary(row: CustomAgentRevisionRow | None) -> CustomRevisionSummary | None:
+        """压缩 ORM Agent 修订为稳定的 API 摘要。"""
+
+        if row is None:
+            return None
+        return CustomRevisionSummary(
+            revision_id=row.revision_id,
+            revision_number=row.revision_number,
+            status=row.status,  # type: ignore[arg-type]
+            checksum=row.checksum,
+            created_at=row.created_at,
+            published_at=row.published_at,
+        )
+
+    @staticmethod
+    def _resource_summary(row: CustomSkillResourceRow) -> CustomResourceSummary:
+        """将资源行转换为不含二进制内容的公开摘要。"""
+
+        return CustomResourceSummary(
+            resource_id=row.resource_id,
+            relative_path=row.relative_path,
+            media_type=row.media_type,
+            checksum=row.checksum,
+            size_bytes=row.size_bytes,
+            created_at=row.created_at,
+        )
+
+    @staticmethod
+    def _contract_check_detail(row: CustomSkillContractCheckRow) -> CustomSkillContractCheck:
+        """将数据库检查行转换为前端可读且不含脚本正文的公开结果。"""
+
+        return CustomSkillContractCheck(
+            check_id=row.check_id,
+            skill_revision_id=row.skill_revision_id,
+            contract_profile_id=row.contract_profile_id,
+            bundle_checksum=row.bundle_checksum,
+            runtime_profile_id=row.runtime_profile_id,
+            protocol_version=row.protocol_version,
+            status=row.status,  # type: ignore[arg-type]
+            dependency_findings=row.report_json.get("dependency_findings", []),
+            diagnostics=row.report_json.get("diagnostics", []),
+            observed_output_fields=row.report_json.get("observed_output_fields", []),
+            observed_output_shapes=row.report_json.get("observed_output_shapes", {}),
+            duration_ms=float(row.report_json.get("duration_ms", 0)),
+            checked_at=row.checked_at,
+        )

@@ -1,0 +1,224 @@
+"""为已有业务函数生成受控脚本入口，不执行用户上传的代码。
+
+生成结果与用户原脚本一起保存到不可变 Skill 修订；发布前检查和正式执行
+读取同一份资源。支持已确认的逐参数函数入口及实体名称逐项转换模板；
+两者都不猜测原函数的业务语义或放宽标准输出契约。
+"""
+
+from __future__ import annotations
+
+from pathlib import PurePosixPath
+
+from kg_agent.extensions.script_field_mapping import EntityRecordAdapter, ScriptFunctionAdapter
+
+GENERATED_ENTRYPOINT = "_kg_skill_entry.py"
+
+
+def render_function_entry(source_path: str, adapter: ScriptFunctionAdapter) -> bytes:
+    """按已确认参数来源生成通用函数适配入口，不修改上传脚本或输出契约。"""
+
+    path = PurePosixPath(source_path)
+    if (
+        not source_path
+        or path.is_absolute()
+        or ".." in path.parts
+        or path.name in {"", "."}
+        or source_path == GENERATED_ENTRYPOINT
+    ):
+        raise ValueError("已有脚本路径非法或与平台入口冲突")
+    arguments = [item.model_dump(mode="json") for item in adapter.arguments]
+    field_bindings = [item.model_dump(mode="json") for item in adapter.field_bindings]
+    source = f'''"""平台生成的函数入口；原始业务脚本保持不变。"""
+
+from __future__ import annotations
+
+import importlib.util
+import inspect
+import sys
+from pathlib import Path
+
+_SOURCE_PATH = {source_path!r}
+_FUNCTION_NAME = {adapter.function_name!r}
+_ARGUMENTS = {arguments!r}
+_FIELD_BINDINGS = {field_bindings!r}
+
+
+def _load_user_module():
+    """只在隔离 Runner 中按确认路径导入原脚本。"""
+
+    source = Path(__file__).resolve().parent / _SOURCE_PATH
+    specification = importlib.util.spec_from_file_location("_kg_uploaded_skill", source)
+    if specification is None or specification.loader is None:
+        raise ValueError("无法加载已上传的业务脚本")
+    module = importlib.util.module_from_spec(specification)
+    sys.modules[specification.name] = module
+    sys.path.insert(0, str(source.parent))
+    specification.loader.exec_module(module)
+    return module
+
+
+def _map_fields(content, parameter_name):
+    """按已确认映射复制单层列表并补字段别名，不修改原 Artifact。"""
+    import copy
+    mapped = copy.deepcopy(content)
+    bindings = [
+        item for item in _FIELD_BINDINGS
+        if item["parameter_name"] == parameter_name
+    ]
+    for binding in bindings:
+        source = binding["source_pointer"].strip("/").split("/")
+        target = binding["target_pointer"].strip("/").split("/")
+        if len(source) != 1:
+            continue
+        source_name, target_name = source[0], target[0]
+        records = mapped.get(source_name)
+        if not isinstance(records, list):
+            raise ValueError("列表来源不存在：" + binding["source_pointer"])
+        if target_name in mapped and mapped[target_name] != records:
+            raise ValueError("列表别名冲突：" + binding["target_pointer"])
+        mapped[target_name] = copy.deepcopy(records)
+    for binding in bindings:
+        source = binding["source_pointer"].strip("/").split("/")
+        target = binding["target_pointer"].strip("/").split("/")
+        if len(source) != 3:
+            continue
+        records = mapped.get(target[0])
+        if not isinstance(records, list):
+            raise ValueError("记录列表不存在：" + binding["target_pointer"])
+        for record in records:
+            if not isinstance(record, dict) or source[2] not in record:
+                raise ValueError("记录字段来源不存在：" + binding["source_pointer"])
+            if target[2] in record and record[target[2]] != record[source[2]]:
+                raise ValueError("字段别名冲突：" + binding["target_pointer"])
+            record[target[2]] = copy.deepcopy(record[source[2]])
+    return mapped
+
+
+async def run(inputs, parameters):
+    """将标准输入按用户确认的映射交给业务函数，原样返回候选结果。"""
+
+    function = getattr(_load_user_module(), _FUNCTION_NAME, None)
+    if not callable(function):
+        raise ValueError("已确认的业务函数不存在")
+    kwargs = {{}}
+    input_fields = parameters.get("input_fields", {{}})
+    for binding in _ARGUMENTS:
+        name = binding["parameter_name"]
+        if binding["source"] == "TASK_PAYLOAD":
+            kwargs[name] = {{"inputs": inputs, "parameters": parameters}}
+        elif binding["source"] == "INPUTS":
+            kwargs[name] = inputs
+        elif binding["source"] == "ARTIFACT_CONTENT":
+            matching = [
+                item for item in inputs
+                if item.get("artifact_type") == binding["artifact_type"]
+            ]
+            if len(matching) != 1 or not isinstance(matching[0].get("content"), dict):
+                raise ValueError(f"脚本参数 {{name}} 需要唯一且完整的上游产物内容")
+            kwargs[name] = _map_fields(matching[0]["content"], name)
+        elif binding["source"] == "ARTIFACT_FIELD":
+            if name not in input_fields:
+                raise ValueError(f"已确认的脚本参数 {{name}} 缺少资料字段")
+            kwargs[name] = input_fields[name]
+        else:
+            raise ValueError("未知的脚本参数来源")
+    result = function(**kwargs)
+    if inspect.isawaitable(result):
+        result = await result
+    if isinstance(result, list):
+        # 旧脚本直接返回记录列表时，仅补可观测的外壳；列表仍须经过
+        # 已确认的输出字段映射及目标 Artifact 契约，不能直接入图。
+        return {{"result": result}}
+    return result
+'''
+    return source.encode("utf-8")
+
+
+def render_entity_record_entry(source_path: str, adapter: EntityRecordAdapter) -> bytes:
+    """生成实体逐项转换入口，参数为原脚本路径和用户确认的函数映射。
+
+    返回可作为 Skill 资源保存的 UTF-8 Python 源码；非法或保留路径抛出
+    ValueError。生成代码在隔离 Runner 内加载原脚本，保留实体身份和证据。
+    """
+
+    path = PurePosixPath(source_path)
+    if (
+        not source_path
+        or path.is_absolute()
+        or ".." in path.parts
+        or path.name in {"", "."}
+        or source_path == GENERATED_ENTRYPOINT
+    ):
+        raise ValueError("已有脚本路径非法或与平台入口冲突")
+    # 所有可变值均作为 Python 字面量嵌入；函数名、参数名和结果键已由
+    # EntityRecordAdapter 的 Pydantic 契约限制，不能拼接任意代码片段。
+    source = f'''"""平台生成的实体转换入口；用户原脚本保持不变。"""
+
+from __future__ import annotations
+
+import copy
+import importlib.util
+import inspect
+import sys
+from pathlib import Path
+
+_SOURCE_PATH = {source_path!r}
+_FUNCTION_NAME = {adapter.function_name!r}
+_PARAMETER_NAME = {adapter.parameter_name!r}
+_RESULT_FIELD = {adapter.result_field!r}
+
+
+def _load_user_module():
+    """仅在隔离 Runner 内按确认路径加载用户原脚本。"""
+
+    source = Path(__file__).resolve().parent / _SOURCE_PATH
+    specification = importlib.util.spec_from_file_location("_kg_uploaded_skill", source)
+    if specification is None or specification.loader is None:
+        raise ValueError("无法加载已上传的业务脚本")
+    module = importlib.util.module_from_spec(specification)
+    sys.modules[specification.name] = module
+    # 用户包内的辅助文件仍由 Runner 的资源目录提供，不访问宿主机代码。
+    sys.path.insert(0, str(source.parent))
+    specification.loader.exec_module(module)
+    return module
+
+
+async def run(inputs, parameters):
+    """把唯一实体数据集逐项交给已确认函数，返回标准 Skill outputs。"""
+
+    matching = [item for item in inputs if item.get("artifact_type") == "EntityDataset"]
+    if len(matching) != 1:
+        raise ValueError("实体转换需要唯一的 EntityDataset 输入")
+    content = matching[0].get("content")
+    if not isinstance(content, dict) or not isinstance(content.get("entities"), list):
+        raise ValueError("实体输入缺少 entities 列表")
+    function = getattr(_load_user_module(), _FUNCTION_NAME, None)
+    if not callable(function):
+        raise ValueError("已确认的实体处理函数不存在")
+    updated = copy.deepcopy(content)
+    for entity in updated["entities"]:
+        if not isinstance(entity, dict) or not isinstance(entity.get("name"), str):
+            raise ValueError("实体缺少名称")
+        original_name = entity["name"]
+        result = function(**{{_PARAMETER_NAME: original_name}})
+        if inspect.isawaitable(result):
+            result = await result
+        name = result if _RESULT_FIELD == "__value__" else (
+            result.get(_RESULT_FIELD) if isinstance(result, dict) else None
+        )
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("实体处理函数未返回非空的标准名称")
+        entity["name"] = name.strip()
+        aliases = entity.get("aliases", [])
+        if not isinstance(aliases, list):
+            raise ValueError("实体 aliases 格式错误")
+        if entity["name"] != original_name and original_name not in aliases:
+            aliases.append(original_name)
+        entity["aliases"] = aliases
+    return {{"outputs": [{{
+        "artifact_type": "EntityDataset",
+        "content": updated,
+        "content_summary": f"已标准化 {{len(updated['entities'])}} 个实体名称",
+    }}]}}
+'''
+    return source.encode("utf-8")

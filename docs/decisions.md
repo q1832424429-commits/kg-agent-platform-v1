@@ -1,0 +1,887 @@
+# 架构决策记录（ADR）
+
+## ADR-001：建立独立新项目仓库
+
+- 状态：已接受
+- 决定：V1 使用独立目录 `kg-agent-platform-v1`，不修改以前的 `agent-workbench` 项目。
+- 原因：项目方向已经彻底调整，需要防止旧代码、旧依赖和旧架构继续影响实现。
+- 明确不采用：在旧项目中直接覆盖、删除或渐进改造原有架构。
+
+## ADR-002：项目只聚焦知识图谱构建
+
+- 状态：已接受
+- 决定：核心业务是根据用户行业、输入和任务目标自适应完成知识图谱构建。
+- 原因：用户已明确项目主线不能偏离知识图谱构建。
+- 明确不采用：用户知识查询、GraphRAG 检索问答、通用聊天助手作为 V1 主业务。
+
+## ADR-003：不再依赖 RAG-Anything
+
+- 状态：已接受
+- 决定：新项目不使用 RAG-Anything 作为文档解析、实体抽取或图谱构建基础。
+- 原因：此前基于 RAG-Anything 延伸的项目方向已经被整体推倒。
+- 明确不采用：包装 RAG-Anything、修改其内部流程或将其作为新平台核心引擎。
+
+## ADR-004：采用一个总控 Agent 与五个专业 Agent
+
+- 状态：已接受
+- 决定：设置一个意图识别、任务拆解与任务分配总控 Agent，以及数据源解析、知识抽取、知识融合、质量评估、图谱管理更新五个专业 Agent。
+- 原因：职责与知识图谱构建专业环节一致，便于独立评测 Agent 的任务理解和 Skill 选择能力。
+- 明确不采用：单一万能 Agent；没有总控的自由群聊式多 Agent；此前的 Workflow 编排 Agent 加执行 Agent 结构。
+
+## ADR-005：总控 Agent 直接拆解并发布 AgentSubTask
+
+- 状态：已接受
+- 决定：总控 Agent 结合 SharedContext、Agent Registry 和 Artifact 拆解 MasterTask，并在子任务中明确负责的专业 Agent。
+- 原因：V1 的核心评测对象正是意图、拆解和分配准确率。
+- 明确不采用：由另一个 Planner Agent 生成流程；由执行 Agent 二次解释和派发；专业 Agent 自由抢占未指定职责的工作。
+
+## ADR-006：不使用动态 Skill DAG 或子 DAG
+
+- 状态：已接受
+- 决定：总控 Agent 只创建 Agent 粒度的子任务和依赖；专业 Agent 自己选择 Skill。
+- 原因：用户明确取消此前的 Workflow Template、动态 Skill DAG、Workflow Validator 和 Execution Agent 主线；面向 AgentSubTask 契约的确定性 SubTaskValidator 仍然保留，DocumentManifest 也不生成子 DAG。
+- 明确不采用：把每个 Skill 表示成全局 DAG 节点；根据 DocumentManifest 动态生成解析子 DAG；恢复已废弃的 Planner/Runtime 设计。
+
+## ADR-007：LangGraph 仅作为 Agent 内部运行时
+
+- 状态：已接受
+- 决定：每个 Agent 可以使用小型固定 LangGraph 管理自身状态、重试、暂停和恢复。
+- 原因：需要结构化 Agent 循环和 Human-in-the-loop 恢复能力，同时保持当前 Agent 协作架构。
+- 明确不采用：使用 LangGraph 构造全局动态 Skill DAG；把 LangGraph 节点等同于 AgentSubTask；引入第二套全局编排 Agent。
+
+## ADR-008：所有 Agent 真实运行，只有业务 Skill 使用 Mock
+
+- 状态：已接受
+- 决定：总控和五个专业 Agent 必须真实调用 LLM 完成决策；业务 Skill 使用确定性 Mock。
+- 原因：V1 主要评测 Agent 的意图、分配、子任务理解和 Skill 选择，而不是底层算法效果。
+- 明确不采用：用固定规则或伪代码替代专业 Agent；用另一个 LLM 随机模拟业务 Skill 输出。
+
+## ADR-009：SharedContext 是任务级逻辑共享上下文
+
+- 状态：已接受
+- 决定：每个 MasterTask 使用一份 SharedTaskContext，所有 Agent 通过服务读写，并只接收按角色过滤的 Context View。
+- 原因：既要共享任务事实，又要避免上下文膨胀、越权和不可审计覆盖。
+- 明确不采用：所有任务共用一个全局大 JSON；把完整 SharedContext 注入每次模型调用；Agent 直接覆盖上下文。
+
+## ADR-010：总控独占正式子任务发布权
+
+- 状态：已接受
+- 决定：专业 Agent 只能在 AgentRunResult 中提出建议子任务；总控 Agent 校验后才能发布正式 AgentSubTask。
+- 原因：保证任务图的一致性和总控分配准确率可评测。
+- 明确不采用：专业 Agent 直接向任务池写入新任务；多个 Agent 同时修改任务拆解结构。
+
+## ADR-011：Agent 和 Skill 采用 Registry 与契约驱动扩展
+
+- 状态：已接受
+- 决定：Agent Registry 暴露专业 Agent 能力；Skill Registry 保存 Owner、权限、版本和 Artifact 输入输出契约。
+- 原因：新增 Agent 或 Skill 时应通过注册扩展，不改总控 Agent 核心分支。
+- 明确不采用：在总控 Prompt 或代码中写死所有 Agent/Skill；允许任意 Agent 调用任意 Skill。
+
+## ADR-012：通过 Artifact 而不是聊天文本交换业务结果
+
+- 状态：已接受
+- 决定：专业工作结果必须形成带类型、版本、内容地址和血缘的 Artifact；SharedContext 保存 ArtifactRef。
+- 原因：支持验证、复用、追踪、版本管理和后续真实 Skill 替换。
+- 明确不采用：将自然语言回复直接视为正式抽取或融合结果；在 SharedContext 中嵌入完整大型文件。
+
+## ADR-013：Task Intent 只有 START、CONTINUE、MODIFY
+
+- 状态：已接受
+- 决定：新建、继续、修改是唯一顶层业务意图；信息不足使用 `NEEDS_CLARIFICATION` 控制结果。
+- 原因：保持意图空间稳定和可评测，同时处理不可安全推断的输入。
+- 明确不采用：把 EXTEND、CORRECT、QUERY 或 NEEDS_CLARIFICATION 增加为并列业务意图。
+
+## ADR-014：TaskSpec 自动生成，不设置确认门禁
+
+- 状态：已接受
+- 决定：总控 Agent 自动创建或修订 TaskSpec，必要信息缺失时才提问。
+- 原因：用户明确 TaskSpec 不需要确认，避免每次任务执行前增加无必要阻塞。
+- 明确不采用：固定的 TaskSpec 用户确认步骤；把 TaskSpec 确认与本体审核混为一谈。
+
+## ADR-015：本体必须先审核发布，再用于实例抽取
+
+- 状态：已接受
+- 决定：已有本体需要确认所用版本；外部本体或新建候选本体必须完成融合、质量评估、用户修改确认和发布；实例抽取依赖 PublishedOntology。
+- 原因：保证实例知识遵循用户认可的标准模型。
+- 明确不采用：跳过本体确认直接抽取实例；把候选本体视为已发布本体；仅在最终图谱发布前统一审核。
+
+## ADR-016：候选图谱必须可修改并经用户确认后发布
+
+- 状态：已接受
+- 决定：用户可通过 ChangeSet 修改实体、关系、属性，合并或拆分实体并查看证据；确认后才能发布。
+- 原因：补齐“抽取结果确认到图谱入库”的业务闭环。
+- 明确不采用：抽取结果自动直接入库；只提供只读预览；由 LLM 自行批准发布。
+
+## ADR-017：Human Review 是确定性门禁，不是 Agent
+
+- 状态：已接受
+- 决定：OntologyApproval 和 GraphApproval 由 HumanReviewService 记录，PublishGuard 在发布前确定性校验。
+- 原因：审批是用户行为和安全约束，不应由 LLM 模拟。
+- 明确不采用：新增审核 Agent；允许专业 Agent 根据自然语言猜测用户是否同意。
+
+## ADR-018：历史 Artifact 支持跨轮次复用
+
+- 状态：已接受
+- 决定：`CONTINUE` 或 `MODIFY` 时检查并复用兼容 Artifact；任务修改产生 revision，不覆盖或删除历史成果。
+- 原因：用户可能先要求实体抽取，后续改为完整构图，不应重复解析和抽取。
+- 明确不采用：每轮从原始文档重新开始；修改任务时删除全部旧 Artifact；只由 LLM 决定复用是否合法。
+
+## ADR-019：Assignment 粒度认领，允许非冲突并行
+
+- 状态：已接受
+- 决定：同一 Assignment 同一时刻只能被一个 Agent 实例认领；同一 MasterTask 可以存在多个非冲突 Assignment。
+- 原因：避免重复执行，同时不无谓串行整个任务。
+- 明确不采用：“同一 MasterTask 同一时刻只能有一个专业 Agent”的过度限制；无锁自由认领。
+
+## ADR-020：V1 单用户、单工作空间、无登录
+
+- 状态：已接受
+- 决定：默认 `default-user` 和 `default-workspace`，保留标识字段但不实现认证授权。
+- 原因：先验证 Agent 模块和任务协作闭环。
+- 明确不采用：V1 建设用户中心、登录、多租户和企业权限体系。
+
+## ADR-021：采用 Python/FastAPI/LangGraph/Pydantic/PostgreSQL/MinIO
+
+- 状态：已接受
+- 决定：Python 3.12、FastAPI、LangGraph、Pydantic v2、SQLAlchemy 2、Alembic、PostgreSQL、MinIO、Docker Compose、pytest 和 uv 组成 V1 基础技术栈；DeepSeek 经 ModelGateway 接入。
+- 原因：满足结构化 Agent、持久化、人工中断、可测试后端和 Linux 隔离部署需要。
+- 明确不采用：AutoGen/CrewAI 作为主框架；V1 同时引入多套 Agent 运行时。
+
+## ADR-022：V1 不引入 Redis、Celery 或 Temporal
+
+- 状态：已接受
+- 决定：V1 worker 通过 PostgreSQL 原子认领 Assignment，并预留 lease、heartbeat 和 fencing token。
+- 原因：当前单用户和 Mock Skill 场景无需增加分布式基础设施复杂度。
+- 明确不采用：Redis 任务队列、Celery worker、Temporal 工作流作为 V1 必需组件。
+
+## ADR-023：V1 不部署真实图数据库和向量数据库
+
+- 状态：已接受
+- 决定：候选和已发布图谱先以标准 JSON Artifact 模拟；长期记忆先使用 PostgreSQL 结构化存储。
+- 原因：V1 验证 Agent 协作，图谱发布和检索算法尚未进入实现范围。
+- 明确不采用：首期部署 Neo4j；为尚不存在的查询链路提前建设向量库、Embedding 和 Reranker。
+
+## ADR-024：外部本体 V1 使用标准 JSON
+
+- 状态：已接受
+- 决定：V1 对外部本体提供版本化 JSON 输入契约。
+- 原因：能够覆盖首期复用、对齐、编辑和发布闭环，控制实现范围。
+- 明确不采用：V1 同时实现 OWL、RDF、TTL 等完整语义网格式解析。
+
+## ADR-025：文档格式由契约覆盖，解析算法使用 Mock
+
+- 状态：已接受
+- 决定：V1 接口和 DocumentManifest 覆盖含文字、图片、表格、扫描内容的 PDF，以及 DOCX、XLSX、PPTX 和图片；具体解析 Skill 使用 Mock。
+- 原因：保留未来真实多模态解析扩展面，同时把 V1 资源放在 Agent 准确率上。
+- 明确不采用：宣称 V1 已实现生产级多模态解析；纳入 DWG。
+
+## ADR-026：自进化仅形成离线、版本化建议
+
+- 状态：已接受
+- 决定：轨迹、审核、反馈和成功经验可以用于评测与产生配置/Prompt/策略建议，但不能自动修改生产系统。
+- 原因：保证可控、可审计，并避免低质量经验直接污染系统。
+- 明确不采用：Agent 自动修改并发布自身 Prompt、Skill、代码或路由策略。
+
+## ADR-027：不保存模型隐藏思维过程
+
+- 状态：已接受
+- 决定：只持久化结构化结论、理由摘要、证据引用、调用记录和指标。
+- 原因：SharedContext 需要业务可审计信息，而不是内部推理文本；同时减少敏感信息和上下文膨胀。
+- 明确不采用：记录完整 chain-of-thought；把隐藏推理作为 Agent 交接协议。
+
+## ADR-028：准确率以 Golden Dataset 离线评测
+
+- 状态：已接受
+- 决定：建立覆盖多轮继续、修改、Artifact 复用、审核、返工、失败和越权场景的 Golden Dataset，并计算意图、拆解、分配和端到端指标。
+- 原因：V1 的价值需要可重复、可比较的准确率证据。
+- 明确不采用：仅靠人工体验判断 Agent 是否正确；只统计模型请求是否成功。
+
+
+
+## ADR-029：冻结第二阶段状态与 Assignment 租约语义
+
+- 状态：已接受
+- 决定：MasterTask 使用 `ACTIVE/WAITING_USER/WAITING_HUMAN/SUCCEEDED/FAILED/CANCELLED`；Assignment 使用 `PENDING/CLAIMED/RUNNING/SUCCEEDED/FAILED/EXPIRED/CANCELLED`；Artifact 使用 `AVAILABLE/INVALIDATED/SUPERSEDED`；HumanReview 使用 `PENDING/APPROVED/REJECTED/CHANGES_REQUESTED/CANCELLED`。Assignment 默认租约 60 秒、心跳 20 秒，实际值允许由环境变量调整。
+- 原因：第二阶段必须用确定性状态机、租约和 fencing token 保证任务事实与并发安全；用户已批准采用实施方案中的默认配置开始编码。
+- 明确不采用：继续使用自由字符串状态；由 LLM 决定合法迁移；以 MasterTask 全局锁替代 Assignment 粒度租约。
+
+## ADR-030：关系状态为事实来源，快照与事件在同一事务生成
+
+- 状态：已接受
+- 决定：PostgreSQL 关系表保存当前任务事实，不可变 revision 表保存历史；SharedContextSnapshot 是版本化投影，TaskEvent 是只追加审计记录，领域变更、事件和新快照必须在同一事务提交。
+- 原因：同时满足查询效率、历史不可覆盖、乐观并发和审计追溯要求。
+- 明确不采用：把一个可覆盖的大 JSON 作为唯一事实来源；只写快照不写事件；事件与业务状态分开提交。
+
+## ADR-031：Artifact 内容使用版本化 Schema 与受控对象存储
+
+- 状态：已接受
+- 决定：V1 的 22 类 Artifact 全部登记到 ArtifactRegistry；JSON 内容先经过对应 Pydantic Schema 校验并规范化序列化，RawDocument 以二进制保存。内容写入 MinIO，PostgreSQL 保存 ArtifactRef、对象键、介质类型、大小及规范化父子血缘；checksum 使用 SHA-256。
+- 原因：Agent 和 Skill 需要稳定、可验证、可追溯的数据交换协议，同时 SharedContext 不能承载完整文档和大型结果。
+- 明确不采用：自由 JSON 直接入库；把大内容写入 SharedContext/PostgreSQL JSON；允许调用方提供任意对象路径；同一对象键覆盖不同内容。
+
+## ADR-032：Artifact 不可变、写入受 fencing 保护并确定性复用
+
+- 状态：已接受
+- 决定：Artifact 内容一经创建不可修改；修订创建新 Artifact 或 ChangeSet，并用父级血缘连接，旧版本可标记为 SUPERSEDED/INVALIDATED。专业 Agent 写入必须携带当前 Assignment 的 worker_id、未过期 lease 和 fencing token。复用由 ArtifactReuseService 同时检查状态、类型、Schema、TaskSpec revision、本体 ID/版本和直接父输入 checksum。
+- 原因：避免过期 Worker 回写、历史覆盖及 LLM 对复用兼容性的主观判断。
+- 明确不采用：原地修改 Artifact；只按名称或类型复用；由 LLM 绕过兼容性校验；专业 Agent 脱离 Assignment 直接写结果。
+
+## ADR-033：V1 使用 18 个注册式确定性 Mock Skill
+
+- 状态：已被 ADR-043 部分替代（Mock 与 Registry 原则保留，Skill 数量及候选图谱职责已变更）
+- 决定：五类专业 Agent 首期共有 18 个业务 Skill，配置保存在 configs/skills/v1.yaml。每个 Skill 声明 Owner、allowlist、输入输出 Artifact、版本、副作用、超时和重试；发布类副作用 Skill 默认关闭，第六阶段接入 PublishGuard 后仅对通过确定性审核校验的调用开放；Mock 支持 SUCCESS、PARTIAL_SUCCESS、LOW_QUALITY、RETRYABLE_FAILURE、PERMANENT_FAILURE 五种确定性场景。
+- 原因：V1 先验证 Agent 的任务理解、Skill 选择和协作闭环，并让未来真实实现能够保持相同公开契约替换 Mock。
+- 明确不采用：用 LLM 生成随机业务结果；在总控 Agent 中硬编码 Skill 分支；允许 Agent 调用 allowlist 外 Skill；把 Skill 重新组织为全局动态 DAG。
+
+## ADR-034：V1 Artifact 容量采用可配置开发默认值
+
+- 状态：已接受
+- 决定：默认单个 Artifact 最大 50 MiB、每个任务最多上传 20 个 RawDocument、任务全部 Artifact 内容总量最大 500 MiB；分别通过 ARTIFACT_MAX_FILE_BYTES、ARTIFACT_MAX_FILES_PER_TASK 和 ARTIFACT_MAX_TOTAL_BYTES_PER_TASK 覆盖。
+- 原因：用户已同意未明确项使用默认配置，V1 需要先采用容易实现和测试的保守限制，并为后续按实际文档规模调整预留配置。
+- 明确不采用：无限制上传；把 20 个文件限制错误应用到所有中间 Artifact；在代码中写死且不可配置的生产容量。
+
+## ADR-035：总控严格遵守目标边界并采用最小当前执行波次
+
+- 状态：已被 ADR-043 替代（目标边界原则保留，最小波次策略废止）
+- 决定：总控 Agent 必须区分解析、知识抽取、候选图谱构建和发布入库四类终点，不得从前一类自动扩大到后一类；用户只要求抽取三元组时，目标不包含 CandidateGraph 或 PublishedGraph。总控默认只发布使用当前已有 Artifact 即可开始的最小必要 AgentSubTask，新 Artifact 或人工审核结果产生后再规划下一波。
+- 原因：一次性生成完整端到端任务链会增加无关子任务，并让尚未生成的 Artifact 无法正确交接；严格限定当前目标和执行波次可以降低不必要子任务率，同时保持专业 Agent 边界与审核门禁。
+- 明确不采用：把“抽取三元组”解释为“构建并发布图谱”；为了展示完整流程一次拆出全部未来子任务；把每个 Skill 单独拆成 AgentSubTask；为了减少数量而合并跨 Agent 或跨人工审核门禁的工作。
+
+## ADR-036：长期记忆正文使用 Mem0 Cloud，SharedContext 只保留召回引用
+
+- 状态：已接受；替代 ADR-023 中“长期记忆使用 PostgreSQL 结构化存储”的子决定，不改变 ADR-023 对图数据库和知识查询向量库的结论。
+- 决定：会话短期记忆和任务事实继续保存在 PostgreSQL；用户授权的稳定偏好、术语、本体选择和专业 Agent 经验写入 Mem0 Cloud。总控每轮按当前问题检索 Mem0，召回结果以 `MemoryRef` 注入总控提示并随 SharedContext 快照向专业 Agent 提供。平台使用 Mem0 V3 REST API 和服务端 Token；未配置 API Key 时能力显式禁用。
+- 原因：当前实现只有 SharedContext 摘要引用，没有跨任务语义召回；Mem0 提供独立的长期记忆提取和搜索能力，同时可以保持 SharedContext 小型、可审计并与 Agent 边界兼容。
+- 失败策略：Mem0 召回或后台经验写入失败不能回滚已经提交的任务、Assignment 或 Artifact；直接记忆 API 仍返回明确错误。用户内容只有在 `authorized=true` 或任务消息 `remember_long_term=true` 时才作为用户长期记忆写入。
+- 明确不采用：继续把长期记忆正文存入 PostgreSQL；把 Mem0 API Key 下发给浏览器或 Agent Prompt；为此新增记忆 Agent；把 Mem0 变成知识图谱查询向量库；云服务失败时静默改成本地长期记忆双写。
+
+## ADR-037：验证实验室使用独立 Mem0 双重命名空间
+
+- 状态：已接受
+- 决定：8002 验证实验室接入 Mem0 Cloud，可以复用服务端 API Key，但固定使用独立的测试 `app_id` 和 `user_id`。正式端与测试端搜索都使用 `app_id AND user_id` 过滤。实验室每轮先召回相关记忆供总控和专业 Agent 使用，成功形成任务后只提交当前公开用户消息、公开 TaskSpec 摘要及专业 Agent 的公开经验；页面日志展示召回数量、摘要引用和异步写入回执。
+- 原因：用户需要观察长期记忆是否影响测试端的意图识别、任务拆解和 Skill 选择，同时未来正式数据不能被测试输入污染。
+- 失败策略：Mem0 召回或写入失败不回滚实验任务，日志明确显示本轮未召回或未写入。测试数据的清理、导出仍作为长期记忆管理 API 的 TODO。
+- 明确不采用：测试端与正式端共用同一数据命名空间；仅靠不同任务 ID 隔离；把所有历史会话、虚拟文件正文或隐藏思维过程整体上传到 Mem0；Mem0 不可用时静默写入 PostgreSQL。
+
+## ADR-038：Mem0 使用显式出站代理，外部写入在 Assignment 心跳结束后执行
+
+- 状态：已接受
+- 决定：WSL 原生 Docker 通过 `OUTBOUND_HTTP_PROXY/OUTBOUND_HTTPS_PROXY` 为应用容器配置出站代理，内部 PostgreSQL、MinIO 和实验数据库进入 `NO_PROXY`。专业 Agent 结果先在 PostgreSQL 原子提交为终态，随后立即停止 Assignment 心跳，最后再非阻断写入 Mem0。
+- 原因：当前 Windows VPN 使用 Fake-IP DNS，Docker 无法直接路由到 Mem0；同时在 Assignment 已变为终态后继续等待 Mem0，会让尚未停止的心跳错误续租 `SUCCEEDED` Assignment 并返回 409。
+- 失败策略：代理或 Mem0 不可用时记录记忆失败，不回滚已经提交的 AgentRunResult、Artifact、Assignment 或 SharedContext；代理凭据与 Mem0 Key 不进入日志和前端。
+- 明确不采用：让数据库容器继承外网代理；在数据库事务中调用 Mem0；Assignment 进入终态后仍保持心跳；用增大 Assignment 租约掩盖网络错误。
+
+## ADR-039：外部本体使用独立 JSON 上传入口和类型化 Artifact
+
+- 状态：已接受
+- 决定：正式工作台与验证实验室都提供独立的“上传本体 JSON”窗口。该字段只接收一个 UTF-8 JSON 对象，并在总控运行前按 `ExternalOntologyContent` 校验、规范化和登记为 `ExternalOntology` Artifact；普通资料继续登记为 `RawDocument`。验证实验室的普通资料仍是动态虚拟输入，但本体 JSON 是真实校验后存入实验室隔离对象存储的输入。
+- 原因：文件选择窗口本身携带明确业务语义，可以防止外部本体被当作普通文档重新解析，并让总控可靠设置 `IMPORT_EXTERNAL_JSON` 与本体 Artifact 引用。
+- 审核边界：上传成功只表示外部本体进入任务上下文，不等于本体已发布；它仍须经过对齐/融合、质量评估和用户审核后，才能成为 `PublishedOntology`。
+- 明确不采用：把所有 `.json` 普通附件自动猜测为本体；把外部本体伪装成 `RawDocument`；上传即发布；测试端把本体内容写入生产 MinIO 或生产 SharedContext。
+
+## ADR-040：验证实验室默认提供隔离的已发布本体前置条件
+
+- 状态：已接受
+- 决定：8002 验证实验室为每个新实验任务默认注入固定制造业设备 `PublishedOntology`，版本为 `simulation-1.0.0`。该 Artifact 使用 `system/simulation_fixture` 明确标记，仅在实验室显式启用测试 fixture 能力时允许创建；正式端保持关闭。后续对话从该实验任务 SharedContext 复用，不重复注入。若本轮上传 ExternalOntology，则外部本体优先且不注入默认本体。
+- 原因：人工测试实体、关系或三元组抽取路由时，需要稳定模拟“已有可复用本体”的前置条件，避免总控无关地规划本体建设和发布。
+- 安全边界：该 fixture 只代表测试前置条件，不代表经过真实 Human Review 或 PublishGuard；生产 ArtifactService 仍拒绝相同方式创建 PublishedOntology。
+- 明确不采用：在正式端内置未经审核的已发布本体；把默认本体伪装成 ExternalOntology；每轮继续任务重复创建本体；用户上传外部本体时仍强制混入默认本体。
+
+## ADR-041：正式端与验证实验室统一采用可持续推进的最小执行波次
+
+- 状态：已被 ADR-043 替代（统一协调器与日志原则保留，最小波次及逐波调用总控废止）
+- 决定：专业 Agent 完成当前 Assignment 波次后，正式 Worker 与 8002 验证实验室都调用同一个确定性 TaskCoordinator。协调器在尚未完成时再次调用总控 Agent，由总控基于最新 SharedContext 和 Artifact 发布下一波最小 AgentSubTask；直到业务语义确认完成、进入人工审核、等待用户、执行失败或触发安全保护。若实体/关系抽取与对齐融合产生同类型 Artifact，TaskSpec.extraction_scope 必须记录对齐要求，目标类型首次出现后由总控做语义完成确认。V1 校验器按已冻结 Skill 契约要求 relation_extract/property_extract 必须读取当前已经存在的 EntityDataset，不能与首次实体抽取并列发布。连续重复波次或拆解 revision 达到 30 时暂停任务，保留现场供人工处理。
+- 日志：PostgreSQL 中的事件、AgentRunResult 与 ExecutionTrace 仍是权威事实；正式端和验证实验室另外按 task_id 写入相互隔离的公开 JSONL 排障日志，只包含结构化结论，不包含隐藏思维、密钥或完整文件正文。
+- 原因：最小波次必须在新 Artifact 产生后自动续接，否则系统只会完成第一项文档解析；仅按 Artifact 类型结束还会把未对齐的数据集错误判断为最终结果。统一协调器可以保持 Agent 边界，并让测试行为与正式运行一致。
+- 明确不采用：恢复一次性完整工作流拆解；新增 Workflow/执行 Agent；在 TaskCoordinator 中硬编码固定知识图谱流水线；仅凭 EntityDataset/RelationDataset 类型存在就忽略用户的对齐目标；只在浏览器内存中保留唯一排障记录。
+
+## ADR-042：显式入库目标采用双向边界校验，验证实验室记录分阶段墙钟耗时
+
+- 状态：已被 ADR-043 部分替代（双向目标边界与耗时记录保留，最小波次描述废止）
+- 决定：总控不仅要阻止把“只抽取”扩大为图谱发布，也必须阻止把“抽取实体关系并入库”等显式发布请求降级为 EntityDataset/RelationDataset。此类请求的 TaskSpec 最终目标必须包含 PublishedGraph；最小当前执行波次可以只发布当前可执行的文档解析子任务，但不能缩短 business_goal 和最终目标。8002 验证实验室记录长期记忆召回、每次总控调用、每个专业 Agent 子任务、每个 Mock Skill、波次协调及本次用户请求端到端墙钟耗时，并在界面与任务 JSONL 中展示。
+- 原因：目标边界必须双向保护。只防止模型过度规划会导致模型把用户明确要求的入库错误裁剪成抽取；只看第一波子任务也无法判断最终目标是否被保留。分阶段耗时可以直接定位模型调用、专业 Agent 或外部记忆服务的延迟。
+- 明确不采用：为了最小波次而改写或缩短用户最终目标；把“实体关系并入库”解释为只输出两个数据集；记录模型隐藏推理；用 CPU 时间代替用户实际等待的墙钟时间；为耗时观测修改 TaskSpec、AgentSubTask 或 AgentRunResult 核心契约。
+
+## ADR-043：总控一次发布完整 Agent 计划，SharedContext 按依赖并行调度并最终验收
+
+- 状态：已接受；替代 ADR-035、ADR-041 的最小波次策略，以及 ADR-033 中的 Skill 数量和候选图谱职责。
+- 决定：总控 Agent 在 START 时根据用户最终目标、输入 Artifact、已发布本体和 Registry，一次性动态生成当前目标所需的完整 AgentSubTask 计划并发布到同一 MasterTask 的 SharedContext。计划不是固定流水线，不把 Skill 拆成全局 DAG，也不得越过专业 Agent 边界。计划生成时已经存在的输入写入 `input_artifact_ids`；未来产物只通过 `dependency_subtask_ids` 指向上游任务，不编造 Artifact ID。
+- 调度：TaskStateService 只为无依赖或依赖已经成功的子任务创建 Assignment；其他任务保持 BLOCKED。专业 Agent Worker 按角色从 SharedContext 认领 Assignment，不同角色中当前可执行的任务并行运行。每个上游成功后，确定性服务解锁依赖全部成功的下游；Worker 根据祖先 AgentRunResult 血缘动态绑定真实 Artifact，并生成本次运行的只读 Context View。
+- 审核与终止：带 `human_review_required=true` 的质量任务成功后不得直接解锁发布任务。HumanReviewService 在用户批准并创建版本绑定 Approval 后才解锁对应 `ontology_publish` 或 `graph_publish`。正常依赖推进不重复调用总控；全部已发布任务进入终态后，TaskCoordinator 才调用总控检查最终目标。目标完成时总控返回空 subtasks；失败、缺失或返工时只创建必要修复任务的新 revision。用户 MODIFY 仍可随时创建新的 TaskSpec 与 decomposition revision。
+- Agent 边界：知识融合 Agent 只负责本体融合、实体对齐、关系标准化和冲突分析；CandidateGraph 由图谱管理更新 Agent 的 `graph_build` 子任务调用新增 `build_candidate_graph` Skill 产生。因此 V1 Registry 共 19 个业务 Skill；其执行模式由后续 ADR-045 约束。
+- 原因：逐最小波次会在每个阶段重复调用总控，放大模型延迟，并可能在中途缩短或漂移用户最终目标。一次性完整计划让人可以在执行前检查意图和拆解是否完整，让无依赖任务自然并行，同时仍由确定性依赖、Artifact 血缘和人工审核门禁保证安全。
+- 明确不采用：最小当前执行波次；每产生一个 Artifact 就重新调用总控；固定知识图谱流水线；全局 Skill DAG、Workflow Planner Agent 或执行 Agent；为未来 Artifact 预造 ID；跨专业 Agent 合并子任务；审核前预先解锁发布；把候选图谱构建归给知识融合 Agent；只凭目标 Artifact 类型存在而跳过总控最终目标检查。
+
+## ADR-044：正式工作台与验证实验室使用 SSE 展示实时进度
+
+- 状态：已接受
+- 决定：正式工作台订阅 PostgreSQL 权威 TaskEvent 的 SSE，并在事件到达后合并刷新任务快照；8002 验证实验室在提交任务前订阅隔离任务 JSONL 的 SSE，实时展示 Mem0、总控、专业 Agent 和协调器的公开阶段事实，结束后以完整 SimulationRunReport 校正最终日志与百分比。两条流均使用事件 ID 断线续传、空闲心跳和禁止代理缓冲响应头。
+- 原因：固定间隔轮询存在延迟和无效请求，测试端完成后再回放日志也不是真实执行过程。SSE 可以在不改变 Agent、Skill、SharedContext、Artifact 和 PostgreSQL 状态机的前提下提供单向实时更新。
+- 事实边界：正式端 PostgreSQL 状态和事件仍是权威事实；测试端 JSONL 只用于隔离人工观察与排障。前端百分比是只读投影，不参与任务调度或完成判定。
+- 明确不采用：继续以浏览器定时轮询作为正式进度机制；测试任务完成后伪装成实时逐条播放；为实时 UI 引入 Redis、Celery、WebSocket 或新的执行框架；把 SSE 事件当作任务事实来源。
+
+## ADR-045：业务 Skill 支持 MOCK 与 LLM 双实现切换
+
+- 状态：已接受；替代 ADR-008、ADR-033、ADR-043 及 AGENTS.md 中“业务 Skill 只能使用确定性 Mock”的子决定，不改变 Agent 数量、职责、权限和 Artifact 契约。
+- 决定：19 个已注册业务 Skill 保持名称、Owner、allowlist、输入输出和副作用声明不变。Skill Registry 同时装配确定性 `MOCK` 与结构化 `LLM` 实现；8002 验证实验室允许每个任务选择模式，正式 Worker 通过服务端 `SKILL_EXECUTION_MODE` 选择。实际模式写入公开运行指标和日志。
+- 安全边界：两种实现都必须经过相同的权限校验、Artifact Schema 校验、PublishGuard 与人工审核门禁。`LLM` 用于端到端语义联通测试，不宣称具备生产级多模态解析、知识融合或图数据库写入能力；`REAL` 只预留，未实现时必须明确拒绝启动。
+- 原因：Mock 能快速、稳定验证任务拆解和调度；LLM 实现可在真实算法完成前验证内容生成、Artifact 传递及错误处理。运行实现可替换而业务契约不变，符合 Registry 扩展边界。
+- 明确不采用：为两种模式复制 Agent 或 Skill 配置；在普通正式任务请求中允许用户临时覆盖生产模式；让 LLM 绕过 Skill 权限、Schema、审核或发布门禁；把 LLM 生成结果描述成已经完成的真实算法；自动回退到另一模式并掩盖失败。
+
+## ADR-046：候选本体直接由用户预览、修改和确认
+
+- 状态：已接受；替代 ADR-015、ADR-043 中“候选本体须先经过质量评估再审核”的子决定，并替代 ADR-045 中“19 个 Skill 保持不变”的数量子决定；不改变候选图谱质量评估流程。
+- 决定：`CandidateOntology` 或 `FusedCandidateOntology` 产生后直接进入 Human Review，不安排 `ontology_quality_evaluate`。从 Skill Registry 和质量评估 Agent 权限中移除 `evaluate_ontology_quality`，当前注册业务 Skill 为 18 个。用户可以预览候选本体、提交 `OntologyChangeSet` 或批准当前版本；修改由图谱管理更新 Agent 应用为新的 `CandidateOntology`，新版本必须再次送审。只有绑定当前候选 ID 与 checksum 的 `OntologyApproval` 才能解锁 `publish_ontology`。发布输入必须是两类候选中的恰好一个，二者作为同一必需输入位置的互斥替代，不能同时发布。
+- 原因：候选本体的业务正确性最终由领域用户确认，V1 不增加一层候选本体自动质量评估；同时保留不可变版本、修改血缘和确定性发布门禁。
+- 明确不采用：Agent 自动批准候选本体；候选本体质量评估作为发布前置步骤；提交修改后直接发布；复用旧候选版本的 Approval；取消候选图谱的质量评估。
+
+## ADR-047：验证实验室允许真实业务文件并显式控制默认本体
+
+- 状态：已接受；替代 ADR-039 中“测试端普通资料只能动态虚拟”的子决定，并扩展 ADR-040 的默认本体注入方式。
+- 决定：8002 验证实验室增加多文件业务文档窗口，支持与正式端相同的 PDF、DOCX、XLSX、PPTX、JPEG、PNG、TIFF 和 WebP MIME 契约；选择真实文件时优先使用真实文件，未选择时仍可根据用户原话创建虚拟文档。页面增加“注入默认已发布本体”开关，新任务默认开启且允许关闭；外部本体上传始终优先。关闭开关且没有外部/历史已发布本体时，总控必须按 `BUILD_FROM_DOCUMENTS` 规划候选本体建设和人工确认。
+- 原因：同一观察台既要快速验证虚拟路由，也要验证真实上传的 Artifact 接入，并能显式覆盖“已有本体”和“无本体自建”两类场景。
+- 明确不采用：始终强制注入默认本体；真实文件和外部本体混用同一字段；上传真实文件后仍额外创建虚拟文档；把测试文件写入生产 MinIO 或生产 PostgreSQL。
+
+## ADR-048：文档解析 Skills 临时使用标准库解析 DOCX 文字与结构
+
+- 状态：已接受
+- 决定：保持 `build_document_manifest`、`parse_document` 的名称、Owner、allowlist 和既有 Artifact 契约不变，在 MOCK 与 LLM 两种联通模式前增加同一个确定性 DOCX 解析包装器。真实 DOCX 使用 Python 标准库读取 OOXML 中的正文段落和表格文字并保留定位；前者生成 `DocumentManifest`，后者生成 `ParsedDocument + SemanticDocument`；非 DOCX 文件继续委托当前模式原有实现。输出通过既有 Artifact Schema 校验，并用明确的 DOCX 质量信号和内容摘要标识真实提取。
+- 原因：当前目标是先让真实 Word 文件能够进入后续本体、实体和关系链路；OOXML 本质是 ZIP 与 XML，标准库已经足以覆盖简单正文和表格，无需为临时能力增加大型依赖。包装器接口稳定，后续替换专业解析服务不会改变 Agent 和 Artifact 调用链。
+- 能力边界：当前只支持 `.docx` 正文段落和表格文字，不支持旧版 `.doc`、图片 OCR、文本框、页眉页脚、批注、公式和复杂版式。没有可提取文字时明确失败，不伪造解析结果。全局 `REAL` 模式仍未开放，其他 Skill 的 MOCK/LLM 语义不变。
+- 明确不采用：把 DOCX ZIP 二进制乱码直接发送给 LLM；让同一解析 Agent 的文档清单步骤继续依赖 LLM 并因超时拖垮已经成功的正文解析；现在引入 Unstructured、LibreOffice 或 OCR 服务；绕过 Skill Registry 和 Artifact Schema；因为临时解析能力新增 Agent 或修改任务拆解架构。
+
+## ADR-049：人工审核后按待处理 Assignment 恢复原计划
+
+- 状态：已接受
+- 决定：验证实验室与正式端使用同一个 `PostgresPublishGuard`。人工批准候选本体或候选图谱后，HumanReviewService 只解锁审核门禁后的发布 Assignment，测试端再继续运行原始完整计划；Worker 执行上限按实际待处理 Assignment 选择 Agent 类型，不能截取 Agent Registry 的前 N 个角色。测试端审核续跑重新订阅 SSE，并记录审核完成、Assignment READY、Agent 开始、租约恢复、Agent 结果和协调状态。进程中断遗留的过期租约由确定性 AssignmentService 回收。
+- 原因：仅产生 Approval 但未装配 PublishGuard 会让发布 Skill 必然失败；按 Registry 顺序截取 Agent 会遗漏实际拥有 PENDING Assignment 的角色；只在 Agent 完成后记录日志会让长模型调用看起来像没有继续。
+- 明确不采用：审核批准后重新调用总控重拆整个计划；绕过 PublishGuard 直接发布；把人工观察提示伪装成新的 HumanReviewRequest；以扩大租约或手工修改 Assignment 状态代替过期租约恢复。
+
+## ADR-050：LLM 联通模式使用有界 Artifact 投影与超时暂停
+
+- 状态：已接受
+- 决定：`LLM` 模式继续让全部业务 Skill 调用大模型，但输入改为按 Artifact 类型构造的有界只读投影，限制单个 Artifact 与单次调用的提示词体积；输出提示使用紧凑字段契约，完整 Pydantic Artifact Schema 仍在模型返回后执行。模型 SDK 不做隐式重试；单次模型超时直接结束当前 Assignment，TaskCoordinator 将 MasterTask 暂停，禁止为同一超时自动发布同类修复子任务。
+- 原因：当前通用 LLM Skill 会将完整 JSON Artifact、完整 Schema 和不断增长的血缘重复发送给模型，导致实体、关系、冲突和构图等下游步骤高频超时，并由多层重试放大为长时间循环。V1 的 LLM 模式目的是验证语义联通和标准 Artifact 流转，不应模拟生产规模全量数据处理。
+- 兼容边界：不新增 Agent、全局 Workflow、Skill DAG 或执行模式；不改变 Skill 名称、权限、输入输出 Artifact 契约、SharedContext、审核或 PublishGuard。后续 `REAL` Skill 可在同一公开契约下实现分块、并发、算法和大模型混合处理。
+- 明确不采用：单纯将全部 Skill 超时无限提高；把完整 Artifact 原文发送给每一个下游模型调用；超时后连续多次重复同一请求；由总控重新规划相同失败子任务；超时时静默回退到 MOCK 并伪装为成功。
+
+## ADR-051：恢复完整 Agent 输出契约，并记录逐次模型调用遥测
+
+- 状态：已接受
+- 决定：总控 Agent 的 Prompt 恢复使用运行时 `TaskDecompositionResult` 的完整 Pydantic JSON Schema，不再维护会遗漏嵌套字段的手写简化输出契约；专业 Agent 继续使用其完整 `ProfessionalAgentDecision` Schema。上下文仍只包含角色完成决策所需的任务事实、Artifact 摘要和能力目录，禁止重新注入完整文档、对象存储地址或全量 SharedContext。每次 OpenAI 兼容模型调用记录脱敏的模型名、端点主机、Prompt 字符数、供应商请求 ID、Token 用量、完成原因、HTTP 错误、端到端耗时以及所属 Controller/专业 Agent/Skill，并通过现有任务 JSONL 供正式端与 8002 测试端观察。
+- 原因：手写简化 Schema 让模型需要猜测正式字段与嵌套约束，增加结构校验失败和修复调用；此前只有 Agent 或 Skill 总耗时，无法区分供应商慢响应、网络失败、响应过长和 Schema 校验失败。完整输出契约与逐次调用指标可以先恢复正确性、再用事实调整各类 Prompt 与超时。
+- 超时策略：模型 SDK 保持无隐式重试；总控默认仅允许一次格式修复；文档、质量与发布类 Skill 使用短上限，抽取类有界样本 Skill 最多 90 秒。超时结束当前 Assignment 并保留现场，不能自动重规划或静默回退。
+- 明确不采用：再次把完整 Artifact 内容或完整聊天记录发送给所有模型调用；记录 Prompt 原文、模型原始回答或隐藏推理；将五分钟等待作为常规实体抽取策略；以多层重试掩盖供应商或网络问题；引入新的 Agent、Workflow/DAG、消息队列或观测存储。
+
+## ADR-052：LLM Skill 在联调期间采用用户确认的三倍等待上限
+
+- 状态：已接受
+- 决定：候选本体抽取保持用户已确认的 180 秒单次上限；其余 17 个 Skill 的超时上限均按调整前配置提高三倍。仍保持一次调用、无隐式重试，超时后由协调器暂停并保留现场。
+- 原因：候选本体抽取已通过 180 秒配置继续推进，但后续本体发布在原 30 秒边界超时。用户明确要求在当前 LLM 联调阶段将其余 Skill 等待上限提高三倍，以验证完整审核、发布与候选图谱链路。
+- 明确不采用：为某次超时自动重复相同模型请求；绕过超时保护直接继续解锁下游任务；把 LLM 超时伪装为成功；改变 Agent、Skill 权限、Artifact 契约或人工审核门禁。
+
+## ADR-053：区分用户多轮消息与内部最终验收，并按 Artifact 影响字段复用
+
+- 状态：已接受
+- 决定：总控请求显式区分 `USER_TURN`、`SYSTEM_CONTINUATION` 与 `FINAL_VERIFICATION`。用户轮次继续由真实总控判断 START、CONTINUE 或 MODIFY；审核修改、失败恢复等系统续办固定为 CONTINUE 并沿用当前 TaskSpec，但仍须发布必要续办子任务；最终验收同样固定为 CONTINUE 并沿用当前 TaskSpec，模型只判断目标是否完成及是否需要修复子任务。正式端和 8002 验证实验室都使用版本化用户消息作为最近对话历史；测试端把消息写入隔离 PostgreSQL，并在浏览器会话中保留当前 task_id/conversation_id。跨 TaskSpec revision 的 Artifact 复用按原始输入、领域、本体 ID/版本、父血缘和影响该 Artifact 内容的结构化抽取参数判断，不再要求整份 TaskSpec 的流程开关、业务目标、最终输出和文字约束完全相等。
+- 原因：实际日志显示，内部验收被模型误判为 START 后触发 `START_WITH_CURRENT_TASK`；用户下一轮扩展目标时，已按当前发布本体产生的 EntityDataset 又因本体策略从 `BUILD_FROM_DOCUMENTS` 变为 `REUSE_PUBLISHED` 而被误判为 revision 不兼容。这两者都不是业务 Artifact 失效，而是运行目的和影响范围没有显式建模。
+- 安全边界：确定性约束不能替代模型判断用户轮次意图；本体 ID/版本、Schema、状态和父 checksum 仍必须通过 ArtifactReuseService；改变原始输入、领域、本体版本或真正的抽取语义参数时仍拒绝复用。测试端对话、数据库和 Mem0 命名空间继续与正式端隔离。
+- 明确不采用：把最终验收或系统续办当成新用户消息；把审核修改续办误当成最终验收并直接结束；以 Prompt 自觉代替内部操作的确定性边界；每轮创建新的 MasterTask 而丢失 Artifact；因为业务目标文字变化就让所有中间产物失效；绕过 ArtifactReuseService 直接接受 LLM 的复用建议。
+
+## ADR-054：验证实验室使用独立 MinIO Bucket 持久化 Artifact
+
+- 状态：已接受
+- 决定：8002 验证实验室继续使用独立 `simulation-db`，Artifact 内容改为写入同一 MinIO 服务中的独立 `SIMULATION_MINIO_BUCKET`。该 Bucket 必须与正式 `MINIO_BUCKET` 不同；应用启动时确定性检查并创建测试 Bucket，健康接口只公开存储类型与 Bucket 名。仅重启 8002 服务时，测试任务元数据、公开对话与 Artifact 内容均可恢复；停止临时 `simulation-db` 后仍按测试环境约定清空任务事实。
+- 原因：测试端此前把 Artifact 内容放在进程内存，而 PostgreSQL 元数据会在 8002 进程重启后继续存在，形成“引用存在、对象不存在”的不一致，导致同一 MasterTask 的下一轮无法读取和复用历史 Artifact。独立 Bucket 保留对象内容且不需要增加新的存储组件。
+- 安全边界：测试端不得使用正式 Bucket；正式端与测试端仍使用不同数据库、日志目录和 Mem0 `app_id + user_id`。历史上已经因进程退出丢失的内存对象无法恢复，旧测试任务必须重新开始。
+- 明确不采用：继续使用进程内存承载可跨轮复用的 Artifact；让测试端写入正式 Artifact Bucket；新增第二套对象存储产品；把大型 Artifact 正文写回 PostgreSQL；绕过 ArtifactService 直接读写文件。
+
+## ADR-055：候选图谱基于上游事实组装，并以只读 SVG 投影供人工审核
+
+- 状态：已被 ADR-056 替代（基于上游事实的确定性构图与只读 API 投影原则保留）
+- 决定：`build_candidate_graph` 仍属于图谱管理更新 Agent 且保持既有输入输出契约，但其 MOCK 和 LLM 联通运行实现均改为确定性读取 `EntityDataset`、`RelationDataset`、`ConflictReport`，并按实际可用输入合并 `PropertyDataset`、`EvidenceDataset`。它只能去重、校验关系端点与属性归属，不能调用模型重写、补造或删除已抽取事实；ID 冲突或悬空引用必须失败，不产生半成品 CandidateGraph。为保证连续 MOCK 链路的可展示性，关系、属性、实体对齐和关系标准化的 Mock 包装器保留上游实体/关系 ID，不改变任何 Skill 名称、权限或 LLM 实现。`GraphPreviewService` 从既有 CandidateGraph/PublishedGraph 生成只读节点—边 API 投影，正式工作台和 8002 使用同一份无依赖原生 SVG 组件渲染；审核中的可视化重命名/删除只追加既有 GraphChangeSet 草稿。
+- 原因：此前通用 Mock 会在相邻 Skill 生成互不关联的占位 ID，候选图谱看起来像三元组 JSON，且无法可靠呈现真实的实体—关系连接。候选图谱是事实汇聚和人工确认的边界，不应该由下游 LLM 再次“创造事实”。可视化应复用当前 Artifact、审核与 ChangeSet 闭环，而不是另建图数据库或前端框架。
+- 明确不采用：把候选图谱构建交回知识融合 Agent；让 `build_candidate_graph` 在 LLM 模式重新调用模型并重写事实；为图谱预览新增 Artifact、Agent、数据库、Neo4j、全局 DAG 或远程图可视化依赖；浏览器直接修改 CandidateGraph/PublishedGraph；用预览告警替代图谱质量评估或 Human Review；把新增、合并、拆分等复杂修改绕过既有 GraphChangeSet。
+
+## ADR-056：候选图谱使用本地 G6 交互工作台，并将编辑原子应用为新版本
+
+- 状态：已接受
+- 决定：正式工作台与 8002 验证实验室共用本地托管的 AntV G6 5.1.1 图谱组件，提供拖拽、缩放、力导向/层级/环形布局、实体类型筛选、文本搜索、节点/关系详情、属性与证据查看。候选图谱审核时，用户可新增、修改、删除实体/关系/属性，以及合并、拆分实体；页面只在浏览器草稿中维护操作栈与撤销/重做，并把操作写入既有 `GraphChangeSet` 表单。拖拽坐标属于临时视图，不写入业务 Artifact。既有 `apply_graph_changeset` Skill 不新增名称、不改变 Owner 或输入输出契约，但在 MOCK 和 LLM 模式均使用同一确定性实现：校验目标 CandidateGraph ID/checksum 后，在副本上原子应用全部操作并生成新的 CandidateGraph；失败时不产生部分输出。实体删除级联删除关联关系与属性；实体合并重定向关系/属性并汇集别名；实体拆分默认把原有关系与属性迁移给第一个新实体，之后仍可用显式关系操作调整。
+- 原因：原生 SVG 适合最初只读预览，但无法达到人工审核需要的在线拖拽、筛选、局部检查与可视化编辑体验。G6 以本地静态文件托管，不依赖运行时 CDN；确定性应用 ChangeSet 可以保证页面中看到的修改与后端新 Artifact 一致，同时继续保留不可变血缘、质量评估和 Human Review/PublishGuard 门禁。
+- 明确不采用：浏览器直接写 CandidateGraph 或 PublishedGraph；将节点坐标混入知识图谱业务事实；以 LLM 重新解释用户明确提交的 ChangeSet；新增 Agent、Skill、图数据库、Neo4j、前端状态数据库、远程 CDN 或第二套审核流程；把图谱编辑后的结果直接发布而跳过质量评估和当前版本审核。
+
+## ADR-057：PublishedGraph 同步持久化为 PostgreSQL 节点—边关系投影
+
+- 状态：已接受；替代此前“V1 不进行真实图数据写入”的子决定，不引入图原生数据库产品。
+- 决定：`publish_graph` 在 MOCK 和 LLM 模式下均使用确定性实现，原样读取当前 CandidateGraph 与绑定其 ID/checksum 的 GraphApproval，生成不可变 PublishedGraph，不允许模型或 Mock 重写已批准事实。PublishedGraph Artifact 正文继续写入 MinIO，Artifact 元数据与血缘继续写入 PostgreSQL；同一数据库事务额外写入 `published_graphs`、`published_graph_nodes`、`published_graph_edges`、`published_graph_properties`、`published_graph_evidence`。图版本记录绑定 PublishedGraph Artifact、来源 CandidateGraph 和 Approval；边与属性使用复合外键约束到同一图版本的节点。正式端和 8002 分别写入各自隔离的 PostgreSQL 数据库。
+- 原因：用户需要发布后知识能够在 PostgreSQL 中按实体、关系类型、邻接端点、属性和证据直接查询，而不仅是 MinIO 中的 JSON 文件。双写不是两套事实来源：PublishedGraph Artifact 是不可变审计事实，PostgreSQL 节点—边表是随其在同一事务生成的查询投影；投影失败必须回滚发布 Artifact 元数据并补偿新上传对象。
+- 明确不采用：把 CandidateGraph 或审核前结果写入发布表；在发布时调用 LLM 改写图谱；只保存一个 JSONB 字段并称为可查询图；引入 Neo4j、Apache AGE、JanusGraph、NebulaGraph 或第二个数据库；取消 MinIO Artifact、Approval、血缘、Human Review 或 PublishGuard；让浏览器直接写发布表。
+
+## ADR-058：总控 Prompt 只承担语义规划，结构正确性由代码核验
+
+- 状态：已接受
+- 决定：总控 Agent 的系统 Prompt 只保留用户目标理解、START/CONTINUE/MODIFY 语义判断、目标边界、最少完整 Agent 级计划、Artifact 复用和本体来源选择，不再逐项重复 UUID、revision、状态枚举、依赖无环、Agent 权限、Artifact 引用、Skill 输入输出、审核门禁等确定性规则。拆解任务 Prompt 只说明本轮产出，不再维护第二份业务规则清单。模型结果继续依次通过 Pydantic 输出契约、`SubTaskValidator`、`HandoffValidator`、`ArtifactReuseValidator`、Registry 和发布服务校验；内部续办与最终验收的不可变边界继续由代码强制应用。五个专业 Agent 的角色 Prompt 则补充本角色职责、每个允许 Skill 的使用场景、输入输出、停止条件和越权边界。
+- 原因：原总控 Prompt 同时复制业务语义、字段契约和运行时校验规则，内容长且重复，模型需要在大量机械约束中寻找本轮目标，增加首轮响应耗时和修复概率；专业 Agent Prompt 反而只有一句角色描述，无法稳定选择最短正确 Skill。把机械正确性放回代码、把业务理解和角色决策留给模型，可减少 Prompt 噪声并让错误以稳定错误码反馈。
+- 安全边界：精简 Prompt 不等于放松校验。任何总控结果在写入 SharedContext 前仍必须通过全部确定性校验，任何专业 Agent 决策在调用 Skill 前仍必须通过 `ProfessionalPlanValidator`，任何发布仍必须通过 Human Review 和 PublishGuard。完整 Pydantic JSON Schema 继续作为模型输出契约，不以手写简化 Schema 替代。
+- 明确不采用：用关键词规则或固定流程代替总控 Agent 的用户意图理解；删除结构化输出 Schema；依赖模型自觉保证权限、依赖、复用或审核；把全量 Skill 说明重新塞进总控 Prompt；为了减少提示词而合并专业 Agent、改变 Skill 契约或取消人工审核。
+
+## ADR-059：移除 Mock Skill、模拟文档与默认模拟本体
+
+- 状态：已接受；替代 ADR-008、ADR-033、ADR-045、ADR-046 中与 Mock 运行、虚拟 RawDocument 或 `simulation_fixture` 默认本体有关的决定。
+- 决定：所有业务 Skill 仅以 LLM 结构化实现或明确注册的正式确定性实现运行。删除 `MOCK` 执行模式、Mock 场景、Mock Skill 源文件、测试端模式选择器、根据自然语言伪造 RawDocument 的分支，以及默认已发布本体注入。8002 只接受真实业务文档、真实外部本体 JSON 或纯文本任务；它使用独立 PostgreSQL 卷、独立 MinIO Bucket 与独立 Mem0 命名空间，并在刷新后只读恢复已持久化任务快照。
+- 原因：模拟输入和模拟运行会掩盖真实文件接入、Agent 路由、Artifact 血缘、审核和失败处理的问题，无法作为完整链路验收依据。测试端仍需隔离，但必须验证与正式端相同的输入真实性和持久化行为。
+- 明确不采用：仅在页面隐藏 Mock 选择器而保留 API 参数；根据用户文本猜测并伪造文件；向新任务自动注入本体；为了测试稳定性绕过 LLM/正式确定性 Skill；测试端写入正式数据库、正式 MinIO Bucket 或正式 Mem0 命名空间。
+
+## ADR-060：已发布资产以受控任务本地版本跨任务复用
+
+- 状态：已接受。
+- 决定：正式端和 8002 分别提供其环境内的 PublishedOntology、PublishedGraph 资产目录。用户可在新建、继续或修改任务时选择已发布本体；系统逐字校验来源内容后在当前任务创建同版本 PublishedOntology 引用副本。选择 PublishedGraph 时，系统移除发布身份字段并原样复制实体、关系、属性和证据，创建新的 CandidateGraph 增量基线。新 Artifact 通过跨任务父血缘指向原发布资产，原发布版本始终不可变；候选基线后续修改仍须经过 ChangeSet、质量评估、人工审核和发布门禁。
+- 原因：直接把其他 MasterTask 的 ArtifactRef 放入当前 SharedContext 会破坏任务隔离和既有复用校验；复制受控任务本地版本既能让现有 Agent/Skill 使用，也能保留来源和版本审计。
+- 明确不采用：直接修改 PublishedGraph；复制后删除来源血缘；允许客户端上传文件并冒充 PublishedOntology/PublishedGraph；绕过新候选图谱的质量评估、人工审核或 PublishGuard；跨正式端与测试端复用资产。
+
+## ADR-061：Skill 采用一包一目录的自包含布局
+
+- 状态：已接受；更新 ADR-033 中集中式 `configs/skills/v1.yaml` 的职责边界。
+- 决定：每个业务 Skill 固定放在 `src/kg_agent/skills/catalog/<skill_name>/`，并以同目录的 `SKILL.md` 作为唯一业务定义。其 YAML front matter 描述名称、输入输出 Artifact、超时、重试和副作用等契约；正文描述执行指令。仅已具备专用算法的 Skill 保留可选的 `implementation.py`，其余 Skill 由通用 LLM 执行器读取 `SKILL.md`、投影输入 Artifact 后调用模型完成。`configs/skills/v1.yaml` 只保存“Skill → 允许调用的专业 Agent”权限清单，不保存 Prompt、实现入口或业务契约。
+- 原因：Skill 是可独立迭代、版本化和替换的业务单元；业务契约与执行说明同位，新增或修改一个 Skill 时不必散落修改多个中心文件。已实现与尚未实现的 Skill 也能共用同一发现、权限校验和 Artifact 契约路径。
+- 明确不采用：把权限、Prompt、实现入口和业务元数据混放在全局 YAML；将提示词存放在与代码分离的全局目录；由 YAML 填写任意 `runtime_module`；为每个未实现 Skill 保留只有转发作用的 Python 包装类；为单个 Skill 的调整修改 Agent、Registry 主流程或其他 Skill 包。
+
+## ADR-062：持久化标识由确定性运行时生成
+
+- 状态：已接受。
+- 决定：总控模型的 `TaskDecompositionResult` 中保留 `AgentSubTask` 完整结构化契约，以维持当前 Pydantic 结构化输出与下游校验兼容；但模型提供的 `subtask_id` 仅是本次候选计划内部依赖的临时标识。总控归一化层在校验前为每个新子任务生成新的 UUID，同时重写计划内部依赖；对已发布历史子任务的依赖保持原 ID。`master_task_id`、`decomposition_revision`、初始状态和创建时间同样由代码写入。TaskSpec 的任务 ID、创建者和创建时间也由运行时固定。
+- 原因：最新联调中模型复制了历史 `subtask_id`，导致 PostgreSQL 在发布计划时拒绝“同一 subtask_id 不同内容”。业务模型应决定任务语义和依赖，而不应生成数据库主键、版本或状态等系统事实。
+- 明确不采用：让 LLM 生成并直接持久化 UUID；因为 UUID 看起来足够随机而接受模型重用历史值；删除 MasterTask、AgentSubTask、Assignment、Artifact 等审计实体；把继续任务的历史依赖改成复制旧子任务 ID。后续可在不破坏公开契约的前提下演进为更轻量的 PlanDraft/节点别名模型。
+
+## ADR-063：已选已发布本体在 V1 强制走不可变复用路线
+
+- 状态：已接受。
+- 决定：当当前用户输入中恰有一个 PublishedOntology，或当前任务已经明确沿用某个 PublishedOntology 时，运行时强制将 TaskSpec 本体策略设为 `REUSE_PUBLISHED`，并写入该本体的 ID 与版本。该本体作为显式输入注入实体、关系和属性抽取任务；总控误加的 `ontology_extract`、`ontology_align`、`ontology_fuse`、`ontology_changeset_apply`、`ontology_publish` 会在发布前被移除，相关候选目标也会被清除。
+- 原因：用户从资产目录选择本体表示“使用此版本作为抽取约束”，而不是授权系统重新建设或覆盖本体。联调中模型虽收到 PublishedOntology Artifact，却错误输出 `BUILD_FROM_DOCUMENTS` 并创建候选本体发布路线。
+- 明确不采用：仅靠 Prompt 期待模型正确选择；把已发布本体当作可直接编辑对象；选择已发布本体后仍默认重建本体；把未来的本体更新偷偷混入实例抽取。V1 本体更新暂不实现，未来必须以已发布版本为基线生成候选新版本，经人工审核后发布，绝不覆盖旧版本。
+
+## ADR-064：总控采用轻量语义草案与确定性计划编译
+
+- 状态：已接受；替代 ADR-051、ADR-058 中“总控模型必须输出完整运行时 Pydantic 契约”的子决定，并落实 ADR-062 预留的轻量 PlanDraft 演进方向。公开 `TaskDecompositionResult`、TaskSpec、AgentSubTask 和 SharedContext 契约不变。
+- 决定：总控模型只输出内部 `TaskPlanDraft`，内容限于 START/CONTINUE/MODIFY、TaskSpec 业务语义、Agent 级子任务、计划内节点别名、依赖、输入引用和期望业务输出。确定性计划编译器负责生成 UUID、revision、初始状态、创建时间，应用内部续办和已选 PublishedOntology 约束，并依据 Skill Registry 的 `supported_subtask_types` 与原子输出契约补齐同一 Skill 必然产生的伴随 Artifact。例如 `extract_relations` 声明 `RelationDataset + EvidenceDataset` 时，模型只写 `RelationDataset` 也会由代码补齐证据输出，后续 `conflict_analyze` 不再因模型遗漏机械字段而错误判为不可执行。
+- 复用边界：模型仍只能提出 `reused_artifact_ids`。类型、Schema、状态、TaskSpec 影响、本体版本、父血缘和 checksum 全部由确定性服务读取权威 Artifact 事实后校验。受控的已发布资产导入副本，其跨任务父级从 PostgreSQL 解析；模型不可见的父 checksum 由该权威快照补齐，不能用请求局部视图的空集合误判导入资产失效。
+- 原因：完整运行时 Schema 迫使模型生成数据库和状态机字段，并记忆每个 Skill 的机械输出组合，增加 Prompt 体积、结构修复调用和错误计划。最近出现的 `EvidenceDataset` 缺失与受控导入 `PARENT_CHECKSUM_MISMATCH` 都属于确定性契约或存储视图问题，重复调用大模型既不能修复权威数据，也会额外增加约一分钟延迟。
+- 安全边界：轻量草案仍由 Pydantic 校验；编译后的完整公共契约仍必须通过 Agent Registry、Skill Registry、SubTaskValidator、HandoffValidator、ArtifactReuseValidator、Human Review 和 PublishGuard。编译器只能补全已选择子任务的系统事实和原子输出，不能新增业务子任务、替用户选择目标或绕过人工审核。
+- 明确不采用：让 LLM 生成 UUID、revision、状态或时间；把全部 Skill 规则复制进系统 Prompt；因缺失 `EvidenceDataset` 再调用模型修复；用局部请求快照否定受控跨任务资产；固定知识图谱流水线、全局 Skill DAG、新增 Workflow/执行 Agent；删除或修改既有公开数据契约。
+
+## ADR-065：LLM Skill 使用目标 Artifact 的深层结构化输出契约
+
+- 状态：已接受；替代 ADR-050、ADR-051 中“LLM Skill 最多一次格式修复”以及只用通用 `content: dict` 接收模型内容的子决定。Agent、Skill 名称、Owner、权限、输入输出 Artifact 类型和下游流程不变。
+- 决定：每个 LLM Skill 在装配时根据 Skill Registry 的 `output_artifact_types` 和 Artifact Registry 的内容模型动态生成专属 Pydantic 响应模型。`artifact_type` 使用 Literal，`content` 直接绑定 `EntityDatasetContent`、`RelationDatasetContent` 等具体模型。模型网关对 Skill 调用优先提交该模型的原生 JSON Schema；兼容端点明确拒绝 JSON Schema 时记录一次协议协商失败，并在本进程后续调用中使用 JSON Object 模式。两种模式返回后均执行同一个完整 Pydantic 校验。
+- 格式与修复：解析前只移除两端空白和包裹整个响应的 `json` Markdown 代码围栏，不从混合说明文本中猜测截取 JSON，不用规则补造业务字段。JSON 解析或 Pydantic 校验失败时，把脱敏后的字段路径、错误类型和错误说明写入下一次修复提示；最多修复两次，即一次初始调用加两次修复调用。超时不做格式重试。两次修复后仍失败则返回失败结果且不产生 Artifact。
+- 下游安全：通过动态响应模型后，Skill 仍须校验输出类型集合完整且不重复；Skill Registry 和 Artifact Registry 继续再次校验权限、输入、Schema 版本与 Artifact 内容。只有全部校验通过的标准 `SkillRunResult` 才能持久化并解锁下游。
+- 原因：此前模型 API 只约束 `outputs[].content` 为任意字典，深层 Artifact 错误在 API 成功后才被发现，日志显示为调用成功却触发整批格式修复。把真实 Artifact Schema 前移到模型生成阶段，可以让 Skill 输出天然匹配下游输入，并在失败时给出准确字段路径。
+- 明确不采用：直接消费模型原始文本；用正则从解释文字中截取可能的 JSON；校验失败后继续保存部分 Artifact；取消 Registry 二次校验；无限重试；因格式优化而合并、拆分或新增 Agent/Skill。
+
+## ADR-066：实体、关系与属性合并为统一知识抽取 Skill
+
+- 状态：已接受；替代 ADR-063 中分别向实体、关系和属性任务注入本体的描述、ADR-064 中以 `extract_relations` 为原子输出示例的描述，以及 ADR-065 中“不因格式优化合并 Skill”的阶段性边界；不改变 Agent 数量、Artifact 类型和下游融合/构图契约。
+- 决定：删除 `extract_entities`、`extract_relations`、`extract_properties` 三个注册 Skill，新增知识抽取 Agent 独占的 `extract_knowledge`。总控只创建一个 `knowledge_extract` AgentSubTask；该 Skill 以 `SemanticDocument + PublishedOntology` 为输入，在一次模型调用中联合输出既有 `EntityDataset + RelationDataset + PropertyDataset + EvidenceDataset`。用户限制抽取范围时通过 TaskSpec、子任务目标和 Skill 参数表达，不再恢复多个串行抽取 Skill。
+- 完整性边界：深层 Pydantic 校验后继续由 Skill 自身的确定性代码检查实体非空（显式 `allow_empty=true` 除外）、知识项 ID 唯一、关系端点和属性主体引用真实实体、每个知识项有证据且统一 EvidenceDataset 覆盖全部内联证据。模型提供的计数必须与数组长度一致；对外摘要和数量由代码根据实际内容重新计算。任何不一致都作为结构化修复错误返回模型，最多沿用 ADR-065 的两次修复，失败时不保存任何抽取 Artifact。
+- 输入策略：统一抽取仍使用有界投影，但针对中小型语义文档把单 Artifact 上限提高到 24,000 字符、总上限提高到 48,000 字符并保留最多 100 个集合项，避免通用 4,000 字符投影只把文档开头交给模型。超出边界的生产级长文档分段抽取与确定性归并仍是后续能力，不在本次修改中伪装实现。
+- 原因：实测中 `SemanticDocument` 有 29 个段落，但旧实体 Skill 持久化的真实内容为 `{"entities":[]}`，同时模型摘要和质量指标却声称存在 16 个实体；Pydantic 只验证类型且允许空列表，旧代码又分别信任内容、摘要和质量指标，因此伪成功解锁了关系、属性和构图任务。三个串行模型调用还重复传递文档、本体与实体，并让首个空结果级联清空全部下游。联合抽取和跨产物确定性校验可以消除该失效边界。
+- 明确不采用：继续用三个串行 LLM Skill；把摘要或模型计数当作 Artifact 内容事实；遇到空实体仍标记成功并解锁下游；由下游关系/属性 Skill 猜测或补造上游实体；只改 Skill 名称而不检查引用、证据与数量一致性；在本次修改中新增 Artifact 类型、Agent、全局 Workflow 或 Skill DAG。
+
+## ADR-067：Skill 原始回答受控留档并以 Artifact ID 完成阶段交接
+
+- 状态：已接受；替代 ADR-051 中“模型原始回答一律不记录”的子决定，仅放宽业务 Skill
+  的结构化回答，不放宽 Agent 回答、Prompt 或隐藏推理。
+- 决定：每次业务 Skill 调用模型后，将模型返回的完整字符串写入任务日志目录下按 task_id
+  与 call_id 隔离的受限文件；任务 JSONL 只记录文件引用、字符数与 SHA-256。原始回答通过
+  Structured Output、Pydantic 和 Skill 语义校验后，由 ArtifactService 生成真实 Artifact ID
+  并持久化。AgentRunResult 新增每次 `invocation_id + skill_name` 对应的输入 Artifact IDs、
+  输出 Artifact IDs 和类型映射。下游只从成功的依赖 AgentRunResult 解析编号，经
+  ArtifactService 校验 checksum 并按 Artifact Registry 内容模型再次校验后读取。
+- 原因：只记录“模型调用成功”无法判断空数据是模型原始生成、结构化转换还是 Artifact
+  流转造成。完整原始回答与最终 Artifact 映射可以逐段核对，同时真实编号仍由确定性运行时
+  产生，避免模型编造 ID 或把未经校验文本送入下游。
+- 安全边界：不保存 Prompt、输入文档全文、总控/专业 Agent 回答、API Key、Mem0 正文或隐藏
+  推理；原始 Skill 文件不进入 SharedContext、不作为业务 Artifact、不通过 SSE 内联返回。
+- 明确不采用：让模型生成 Artifact UUID；将完整原始回答直接写进公开 JSONL 或 SharedContext；
+  下游直接消费模型字符串；跳过 checksum、Pydantic、Registry 或血缘校验；新增 Agent、Skill、
+  全局 Workflow 或第二套业务存储。
+
+## ADR-068：统一知识抽取使用扁平必填响应并限制为一次修复
+
+- 状态：已接受；细化 ADR-065、ADR-066，并替代其中知识抽取仍使用通用
+  `outputs[] + anyOf` 外壳及“初次调用加两次修复”的子决定。
+- 决定：`extract_knowledge` 使用专用 `KnowledgeExtractionResponse`，模型顶层只返回
+  `entities`、`relations`、`properties`、`evidence` 四个必填数组。实体、关系和属性记录的
+  evidence 也是必填非空数组。模型不生成 Artifact 类型、摘要、计数或 quality_signals；代码
+  完成跨引用和证据覆盖校验后，确定性拆分为既有四类 Artifact，生成摘要、统计和真实编号。
+  所有 LLM Skill 最多执行初次调用加一次结构化修复；修复后仍不合法返回不可重试 FAILED，
+  不再创建新的 Assignment。输入 Artifact 契约非法同样不可重试；明确超时仍保留可恢复语义。
+- 原因：真实日志中的模型原始响应只包含四个 `content_summary` 和 `schema_version`，声称抽取
+  23 个实体却完全省略 `entities`。原因是 Artifact 内容模型的 `default_factory=list` 使数组未
+  进入 JSON Schema 的 required，Pydantic 又把省略字段补为空数组。第三次修复甚至生成 40 个
+  EntityDataset。扁平必填 Schema 能在模型边界直接拒绝省略字段，同时降低联合类型复杂度。
+- 明确不采用：继续依赖 Prompt 要求模型填充可省略字段；让模型组装四个 Artifact 外壳；根据
+  摘要或模型计数补造实体；连续创建 Assignment 重复同一确定性无效输出；通过增加超时解决
+  Schema 缺陷；修改 Agent 数量、Artifact 类型、审核门禁或全局协作架构。
+
+## ADR-069：验证实验室在正式发布子任务前审核候选计划
+
+- 状态：已接受；替代测试端“子任务已经写入 SharedContext 后再批准执行”的临时实现，不改变 ADR-014 的 TaskSpec 非独立确认决定。
+- 决定：8002 中总控先完成真实模型规划、确定性编译和全部 Validator，但以 `publish_decomposition=false` 停在候选结果，不创建 MasterTask、AgentSubTask 或 AgentAssignment。候选计划和未落库的真实输入写入测试端隔离 MinIO 暂存区，JSONL 只记录索引和状态。审核窗口按计划内部依赖拓扑分为执行阶段，展示意图、目标和完整候选子任务；用户可批准、提交自然语言修改意见让总控生成新候选 revision，或仅在同一执行阶段内上下调整子任务优先顺序。批准接口必须校验顺序恰好覆盖全部候选子任务且不违反前置依赖，再通过原 TaskStateService 原子发布并开始 Worker 认领。依赖关系不允许通过排序绕过。
+- 原因：发布后的审核无法阻止错误子任务进入 SharedContext，也无法让用户在 Worker 认领前纠正总控计划；只在前端隐藏执行按钮不是真正的发布门禁。两阶段发布能让人工评测发生在正确边界，同时复用原有 Validator、TaskStateService、Assignment 和审计契约。
+- 明确不采用：先发布 AgentSubTask 再做形式审核；批准前创建 Assignment；让浏览器直接写数据库；用户排序删除依赖或绕过 Validator；把候选计划伪装为正式 SharedContext；新增 Planner、Workflow 或执行 Agent；把该门禁与本体/图谱审核合并；默认强制正式端启用该测试评测门禁。
+
+## ADR-070：统一证据确定性生成并保留首个不可重试失败
+
+- 状态：已接受；细化 ADR-060、ADR-064、ADR-066，并替代 ADR-068 中要求模型同时生成顶层 `evidence` 数组的子决定。
+- 决定：`extract_knowledge` 的模型响应只包含 `entities`、`relations`、`properties` 三个必填数组，每个知识项仍必须携带至少一个 EvidencePointer。Skill 代码按 `source_artifact_id + locator + quote` 对全部内联指针去重，并由规范化指针内容生成稳定 evidence ID，确定性构建标准 EvidenceDataset；模型不再重复维护顶层统一证据表。四类公开 Artifact、Skill 名称、Owner、权限和下游契约不变。
+- 资产复用：对于 `published_asset_import` 和 `published_graph_baseline_import` 产生的受控任务本地副本，内部续跑时由 PostgreSQL 复用服务读取同一权威父级快照并补齐调用方不可见的跨任务父 checksum。普通 Artifact 仍使用调用方的明确期望值，父血缘、类型、状态、本体版本和 Schema 门禁不放宽。
+- 失败收口：当前 decomposition revision 中任一专业 Agent 返回不可重试 `FAILED` 后，TaskCoordinator 将 MasterTask 置为 `WAITING_USER` 并保留该 AgentRunResult 的原始 blocking issues；不得再调用总控最终目标检查。历史 revision 的失败不阻断后续已经发布的修复计划。
+- 原因：真实联调中模型已经生成 22 个实体、22 条关系和 31 个属性，但仅生成 12 条顶层证据，造成两套内容不一致并在一次修复后整体丢弃。随后协调器仍调用总控，受控已发布本体的跨任务父级不在当前 Context View 中，又产生 `PARENT_CHECKSUM_MISMATCH`，覆盖了首个业务错误。把可机械完成的证据归一化和父 checksum 解析放回代码，可以减少模型输出、避免无效重试并保留真实故障现场。
+- 明确不采用：放宽每个知识项必须有证据的要求；保存部分未通过校验的抽取结果；让模型继续同时维护内联证据和统一证据两份数据；为修复 checksum 跳过血缘门禁；专业 Agent 明确不可重试失败后仍调用总控重规划或最终验收；修改 Agent 数量、全局协作架构或人工审核门禁。
+
+## ADR-071：增量图谱更新先生成 GraphChangeSet 草案
+
+- 状态：已接受。
+- 决定：新增图谱管理更新 Agent 独占的 `generate_graph_changeset` LLM Skill。它以已有 `CandidateGraph`、`PublishedOntology` 和本轮 `EntityDataset`、`RelationDataset`、`PropertyDataset`、`EvidenceDataset` 为输入，只生成绑定基线 Artifact ID 与 checksum 的 `GraphChangeSet` 草案。草案是构建增量候选图谱的中间 Artifact，不直接替代用户在候选图谱上的审核与编辑。运行时以 Skill 元数据 `requires_dedicated_subtask=true` 强制它的 AgentSubTask 只能声明 `GraphChangeSet`。后续必须由依赖该草案的独立 `graph_changeset_apply` 子任务，使用同一基线确定性生成新的 `CandidateGraph`；用户在该候选图谱预览中查看、修改和批准，随后才进入图谱审核与发布门禁。
+- 原因：用户需要基于新文档对既有候选图谱做增量更新，而现有 `apply_graph_changeset` 只能应用用户已经提交的操作，不能完成“新知识与旧图谱对比并提出修改”的语义工作。拆出草案生成与确定性应用可避免 LLM 直接改写候选图谱，也修复了同一个专业 AgentRun 不能把刚生成但尚未持久化的草案自动作为下一次 Skill 输入的运行时事实；用户能审计旧图谱、差异草案和应用后的预览版本。
+- 明确不采用：新增专业 Agent；让 `apply_graph_changeset` 同时承担差异推理和修改应用；在一个 AgentSubTask 中合并 `graph_changeset_generate` 和 `graph_changeset_apply`；自动把 LLM 建议直接写入 CandidateGraph；跳过用户查看/编辑直接发布；引入动态 Skill DAG、Workflow 编排 Agent 或执行 Agent。
+
+## ADR-072：以 PostgreSQL 定义包扩展受控自定义 Agent 与 Skill
+
+- 状态：已接受。
+- 决定：保留五个内置专业 Agent 与仓库内置 Skill，同时允许用户在前端创建、测试、发布和停用自定义专业 Agent 与 Skill。自定义定义包全部存入 PostgreSQL：Skill 使用 `SKILL.md` 元数据与正文、可选脚本和捆绑资源；Agent 使用 `AGENT.md` 元数据与正文及 `permissions.yaml`。前端不展示版本号，后端以不可变 revision 和 `current_revision_id` 固定新任务、历史任务和回滚所用定义。旧 revision 不进入新任务发现范围。Skill 调用权限只以 Agent revision 中的 `permissions.yaml` 为事实来源；运行时可派生临时 allowlist，但不在 Skill 元数据中持久化第二份权限。内置文件 Provider 与 PostgreSQL Custom Provider 合并为 Composite Registry；总控发现并分配 Agent，专业 Agent 再按 YAML 权限发现和调用 Skill。自定义 Agent继续使用现有通用专业 Agent Runtime，不生成新的 Python Agent 类。
+- 资源与执行：Skill 正文和资源按需读取；脚本不进入模型上下文。脚本执行必须经独立 Sandbox Runner，不能在 API 或 Worker 主进程直接执行。本 ADR 的“第一阶段只开放 LLM”状态已经由 ADR-073 的自动脚本识别与隔离执行实现替代。
+- 权限边界：自定义 Agent 不得创建正式 AgentSubTask、修改 TaskSpec、绕过 Human Review，或调用本体/图谱发布类 Skill。自定义 Skill 第一阶段只能声明既有 Artifact 类型，不能创建新的 Artifact Schema。
+- 原因：用户需要在不修改仓库源码和不重启服务的情况下扩展领域能力，同时保留总控分配、SharedContext 裁剪、Artifact 契约、审核门禁和历史任务可追溯性。
+- 明确不采用：把用户 Agent/Skill 直接写入内置目录；让用户直接执行宿主机脚本；把完整 SharedContext 或全部资源注入模型；在 Skill 元数据中复制 Agent 权限；让总控直接调用 Skill；新增第二个总控、Workflow 编排 Agent 或执行 Agent；前端向用户暴露内部 revision。
+
+## ADR-073：自定义 Agent 多选 Skill 与隔离执行 SCRIPT Skill
+
+- 状态：已接受。
+- 决定：前端创建自定义 Agent 时，从内置及当前已发布自定义 Skill 中多选调用权限，仍只写入该自定义 Agent 修订的 `permissions.yaml`；内置 Agent 的权限文件和行为不变。Agent 的任务类型及输入输出能力仍作为路由契约保留，界面可根据所选 Skill 预填并允许收窄。
+- 决定：`SCRIPT` 是系统内部执行实现，不是用户需要选择的 Skill 产品类型。创建表单只提供可选资源上传；发布服务检查当前不可变修订，未上传 `.py` 时使用 SKILL.md 作为大模型提示词，单个 `.py` 自动作为入口，多个 `.py` 必须包含唯一 `main.py`。脚本和参考文件继续绑定不可变 Skill 修订；脚本只在独立、无网络、无业务凭证且具备资源限额的 Sandbox Runner 中执行。Worker/API 不直接导入或执行用户脚本。脚本经标准输入接收受控 Artifact 内容与参数，经标准输出返回结构化候选结果；仍须通过 Skill Registry、Artifact Registry 和现有任务门禁。
+- 原因：用户需要把自己编写的算法作为 Skill 使用，同时保持 Agent 分配、Artifact 契约、权限及正式发布门禁不变。
+- 明确不采用：在 Skill 元数据中持久化第二份 Agent 授权；通过网页修改内置 Agent 权限；在 API/Worker 中 `exec` 用户代码；给脚本注入数据库、MinIO、模型密钥或宿主机 Docker socket；脚本自动创建未注册 Artifact 类型或绕过审核直接发布。
+
+## ADR-074：提供不依赖 Docker 的本机 uv 联调存储
+
+- 状态：已接受；只适用于用户明确要求的单机开发启动方式，不替代正式部署架构。
+- 决定：设置 `LOCAL_UV_DATA_DIR` 时，正式 API 与 Worker 使用同一 SQLite 文件和本地受控
+  Artifact 目录；设置 `SIMULATION_LOCAL_UV_DATA_DIR` 时，8002 使用独立 SQLite 文件和独立
+  Artifact 目录。对象键继续实施路径逃逸检查、不可变写入和原子落盘。未设置这些变量时，正式
+  路径仍严格要求 PostgreSQL 与 MinIO。SCRIPT Skill 在纯 uv 模式不降级为宿主机执行，缺少独立
+  Runner 时明确失败。
+- 原因：当前主机没有 PostgreSQL、MinIO 本地程序或监听服务，`.env` 中地址仅能在 Compose 网络
+  内解析；用户要求不启动 Docker，仍需让 8000、8002 与 Worker 在本机持久运行和保留联调数据。
+- 明确不采用：在本机直接执行用户脚本；把生产环境静默切换到 SQLite；复用正式与测试端同一个
+  SQLite 文件或对象目录；用进程内内存存储伪装为可跨重启持久化；移除 PostgreSQL/MinIO 正式路线。
+
+## ADR-075：非开发者以业务语言创建受控自定义能力
+
+- 状态：已接受。
+- 决定：正式端和测试端的“自定义能力”创建入口不再让用户填写 Artifact 类型、子任务类型、
+  内部 key、AGENT.md/SKILL.md、YAML 或运行实现。用户创建 Skill 时只描述名称、解决的问题、
+  适用资料、预期结果、典型提问和可选补充/资源；受控定义服务生成内部 key 和任务类型，并将当前
+  文档类 Skill 确定性编译为 `SemanticDocument → StructuredDataset`。用户创建 Agent 时只描述
+  职责、适用场景、典型提问并多选已发布 Skill；服务端从权威 Skill 目录推导 Agent 的任务类型、
+  可接受输入和可产生输出，并将最终授权唯一写入 `permissions.yaml`。两类定义都先生成草稿，
+  前端显示业务化预览，用户确认后才调用既有发布接口；管理页只承担查看、发布和停用。
+- 原因：Artifact 和子任务类型是系统内部数据流契约，要求业务用户填写会导致“未知产物类型”等
+  无法理解的错误，也会让浏览器承担不应拥有的契约拼装职责。固定使用既有冻结 Artifact 类型可
+  保持 Pydantic、Registry、血缘和权限校验，不创建自由 JSON 或新的未审核 Schema。
+- 明确不采用：让用户猜测或手填内部 Artifact 类型；把任意 JSON 作为自定义 Skill 的正式输出；
+  由浏览器提交 Agent 输入输出契约；自动发布未经预览的定义；新增创建/编排 Agent；放宽
+  permissions.yaml、Artifact Registry、PublishGuard 或脚本隔离边界。
+
+## ADR-076：已停用自定义能力才可物理删除
+
+- 状态：已接受。
+- 决定：自定义 Agent 与 Skill 管理页提供删除操作，但仅当稳定定义状态为 `DISABLED` 时启用，且必须
+  经浏览器二次确认。删除会物理移除定义身份、所有内部 revision，以及 Skill 的捆绑资源；Skill 删除
+  前服务端再次检查没有活动自定义 Agent 的 `permissions.yaml` 引用该 Skill。历史 MasterTask、
+  Assignment、AgentRunResult、ExecutionTrace、日志及 Artifact 不级联删除，保留其当时的运行期
+  快照、key 和 Artifact 引用以供审计。
+- 原因：停用只能阻止新任务发现，无法清理用户确认废弃的自定义定义；但直接删除活动能力会改变正在
+  路由或可恢复任务的运行环境，也会使权限依赖悬空。以“先停用、再确认删除”作为唯一入口，可在清理
+  需求与运行期安全、历史追溯之间保持边界清晰。
+- 明确不采用：删除活动或草稿定义；删除 Skill 时忽略活动 Agent 的 YAML 引用；把“删除”实现为仅
+  隐藏 UI；级联删除历史任务、执行日志或业务 Artifact；为已删除定义保留一个仍可被新任务发现的
+  软删除版本。
+
+## ADR-077：业务显示名称与内部运行标识分离
+
+- 状态：已接受。
+- 决定：自定义 Skill 和 Agent 均以用户输入名称作为业务显示名称。Skill 将其写入
+  `SKILL.md` 的 `display_name`，Agent 将其写入 `AGENT.md` 的 `name` / `display_name`；
+  该名称用于创建预览、管理界面、可选 Skill 列表和模型可见能力目录。系统继续生成不可变 ASCII
+  `skill_key` / `agent_key`，其仅用于 Registry、权限 YAML、SkillInvocation、Assignment 和
+  Artifact 血缘。`SkillRegistration.name` 保持内部 key，新增 `display_name` 作为展示与提示词
+  字段。旧 revision 不改写，加载时从稳定身份表补齐显示名称。
+- 原因：业务用户应能在定义和选择能力时看到自己填写的名称；但直接将可重名、可改名、可含中文的
+  业务名称作为执行身份，会使权限引用、调用校验和历史血缘不稳定。
+- 明确不采用：以用户名称直接替代 Registry key；要求用户填写拼音/ASCII key；改写历史已发布
+  revision；在权限 YAML 中同时保存显示名和内部 key 两套授权；在管理页面显示随机内部 key。
+
+## ADR-078：发布资产目录只展示正式发布版本并绑定用户名称
+
+- 状态：已接受。
+- 决定：用户批准 CandidateOntology 或 CandidateGraph 时可填写发布名称；名称写入绑定当前目标
+  Artifact ID/checksum 的 ApprovalContent，并由确定性 `publish_ontology` / `publish_graph` 原样带入
+  PublishedOntology / PublishedGraph 与其 ArtifactRef。正式端和测试端分别提供“已发布资产”页，
+  仅浏览本环境真实正式发布的本体和图谱，支持查看本体 JSON、查看图谱 JSON 和交互预览 PublishedGraph。
+  跨任务复用仍创建当前任务的受控输入副本保存血缘，但 `producer_skill=published_asset_import` 的
+  PublishedOntology 副本必须被资产目录排除，不能被误认为再次发布；早期未命名历史资产以原摘要兼容展示。
+- 原因：此前资产目录按 Artifact 类型查询，导致复用已发布本体时每个任务内导入副本都被重复列出，
+  用户无法区分真正可管理的发布版本与任务输入。发布名称同时避免让用户用内部 UUID 管理本体和图谱。
+- 明确不采用：取消任务内导入副本或跨任务血缘；让复用本体再次走发布流程；用可变数据库字段改写已
+  发布资产名称；把候选、导入副本或未通过审核的图谱放入已发布资产目录；让模型在发布阶段重写用户
+  已批准的本体或图谱事实。
+
+## ADR-079：任务事实由确定性编译器优先于总控模型计划
+
+- 状态：已接受。
+- 决定：总控 Agent 仍由 LLM 理解业务意图并拆解 Agent 级子任务；但可由当前请求和 SharedContext
+  唯一确定的事实由计划编译器写入，包括本体来源策略、唯一外部/已发布本体选择、明确“实体关系/
+  三元组入库”的 `PublishedGraph` 最终目标，以及“需要澄清时不得发布猜测子任务”的约束。
+- 原因：这些字段若交给模型猜测，容易出现空本体 ID、遗漏最终发布目标或“澄清与派发同时发生”，进而
+  触发无价值的模型修复重试并拉长任务耗时。
+- 明确不采用：以规则替代 LLM 对业务意图、业务目标和专业 Agent 级子任务的理解；在校验失败后把
+  数据库/Artifact 事实反复交给模型猜测修复；澄清信息不足时静默发布推测任务。
+
+## ADR-080：专业 Agent 按 Skill 契约唯一匹配并执行对应实现
+
+- 状态：已接受。
+- 决定：Skill 是专业 Agent 可加载的能力包，不在产品概念上拆成“LLM Skill”和“脚本 Skill”。
+  专业 Agent 先依据已发布权限、子任务类型、正式输入 Artifact 与预期输出做确定性最小覆盖筛选；
+  唯一匹配时直接形成 Skill 调用计划，不额外调用模型选择。无 Python 入口的能力由 Agent 加载
+  `SKILL.md`、输入投影与输出 Schema 后调用一次模型；包含已发布 Python 入口的能力固定交给隔离
+  SCRIPT Runner，全程不调用模型。只有多个合法最小方案无法唯一选择，或需要判断是否向用户补充
+  信息时，才调用专业 Agent 模型进行选择。日志必须逐 Skill 记录实际执行器、耗时和脚本执行事实，
+  不能以任务级默认模式冒充实际执行方式。
+- 原因：此前专业 Agent 先调用模型选择唯一 Skill，提示词型 Skill 随后再次调用模型生成结果，造成
+  无意义的双模型调用；脚本 Skill 虽已正确覆盖默认模式，日志却仍显示任务级 `LLM`，使用户误判脚本
+  未执行。唯一契约匹配属于权限和类型事实，可由代码可靠完成，业务推理仍由 Agent 加载 Skill 后完成。
+- 明确不采用：让用户选择 LLM/SCRIPT 类型；把 Skill 建模成独立 Agent；脚本执行时再调用模型；
+  存在多个同等合法 Skill 时按名称或顺序随意选择；绕过 Agent YAML、Skill Registry、Artifact Schema
+  或脚本沙箱；删除实际模型调用和脚本执行的逐项日志。
+
+## ADR-081：自定义 Skill 使用受控契约模板并支持三种集成模式
+
+- 状态：已接受。
+- 决定：自定义 Skill 不再永久固定为 `SemanticDocument → StructuredDataset`。代码提供版本化
+  Contract Profile Registry，覆盖 `PIPELINE`、`SIDE_OUTPUT`、`STANDALONE` 三种模式及其既有
+  Artifact 输入输出。创建时模型只能从注册 Profile 中推荐一项，Pydantic 校验后由代码重新查表，
+  前端以业务语言展示并由用户确认；模型不得创造 Artifact 或权限。自定义 Agent 仍不调用模型创建，
+  其任务类型、输入和输出由所选 Skill 确定性合并。
+- 决定：Artifact Registry 新增 `TextReport`，用于独立或旁路 Agent 的文字交付。表格结果继续使用
+  `StructuredDataset`；第一阶段不增加模糊 `CustomArtifact` 或二进制 `GeneratedFile`。没有输入
+  Artifact 的独立 Skill 从受保护的专业 Agent Context 参数取得任务目标、业务目标、完成标准、领域
+  和约束。
+- 决定：不兼容计划可以保留为草稿和公开校验错误，但不得发布为 SharedContext 中可认领的正式
+  AgentSubTask。流程型节点必须满足现有 Agent/Skill/Artifact 执行性校验；旁路和终端节点不要求
+  下游，但输出必须覆盖用户目标。历史自定义 Skill 缺少 Profile 时映射到
+  `document_table_analysis`，不修改历史修订。
+- 原因：固定文档表格契约只能把自定义能力作为末端分析，无法安全插入实体、关系、属性或图谱增量
+  环节，也无法表达纯问题文字报告。让模型自由发明类型又会破坏 Pydantic、血缘和下游兼容性。
+- 明确不采用：由用户填写 Artifact 名称；由模型自由生成输入输出 Schema；把不兼容计划发布后再
+  等 Worker 失败；让独立 Agent 获得本体或图谱发布权限；以 `StructuredDataset` 冒充所有文字或
+  业务产物；识别失败时静默回退到旧固定契约。
+
+## ADR-082：长期记忆采用候选召回、重排、去重与成功经验质量门禁
+
+- 状态：已被 ADR-083 部分替代；召回、短期对话额度与 Mem0 环境隔离规则继续有效，自动写入时点及专业 Agent 独立经验写入规则由 ADR-083 取代。
+- 决定：长期记忆召回先从 Mem0 获取大于最终返回数量的候选集，使用服务端相关度阈值和可选重排，
+  再由 MemoryService 过滤 `SUPERSEDED / INACTIVE / DELETED / REJECTED` 状态、折叠完全重复及近似
+  重复文本，最后只把少量 `MemoryRef` 摘要注入角色化 Context View。启用供应商重排时保留其返回
+  顺序；未启用时才使用相关度和更新时间进行内部排序。时间戳不进入 Agent Prompt。
+- 决定：用户授权记忆与专业 Agent 经验写入前执行高阈值重复预检；重复项返回明确跳过回执。任务轮次
+  继续使用 Mem0 `infer=true` 做事实提炼和冲突归并，避免为用户请求增加额外同步预检延迟。只有状态
+  为 `SUCCESS`、存在真实输出 Artifact 且无阻塞问题的专业 Agent 结果可以沉淀经验；失败、部分成功
+  和等待用户输入只保留在任务事实与日志中。
+- 决定：短期对话、长期记忆和任务结构化事实分开计数。每个成功用户轮次原子保存一条公开 `USER`
+  消息和一条由已校验总控结果生成的公开 `ASSISTANT` 摘要；总控与专业 Agent 每次只读取最近五轮、
+  共十条对话。Mem0 每次最多召回三条长期记忆；TaskSpec、Artifact、子任务、Assignment 和审核状态
+  不占这十三条额度。SharedContext 当前快照只投影最近十条对话引用，完整对话正文仍由 PostgreSQL
+  会话表保存。任务 JSONL/SSE 和两个工作台允许展示实际交给 Agent 的最终三条记忆摘要、顺位与
+  相关度，但不得展示 Mem0 候选池、原始响应、凭据或其他环境记忆。正式端和测试端继续使用不同
+  `app_id + user_id`，云端读写失败仍不得回滚任务。
+- 原因：原实现只执行一次向量搜索，未启用重排，也没有失效过滤、应用层去重和经验成功门禁；重复、
+  失败或过期信息可能累积并进入 Agent Prompt，同时 SharedContext 引用会随轮次增长。
+- 明确不采用：只保存用户消息而缺失 Agent 回复；把对话轮次与任务状态混成同一额度；新增记忆 Agent；
+  把所有会话全文写入 Mem0；把 Mem0 正文复制到 PostgreSQL；把时间戳
+  或完整候选列表塞给 Agent；让 LLM 判断状态、授权或成功门禁；因去重预检或 Mem0 故障阻断主任务；
+  自动删除供应商历史记录。长期记忆撤销、删除和导出 API 仍为 TODO。
+
+## ADR-083：完整任务成功后统一沉淀一条长期经验
+
+- 状态：已接受；替代 ADR-082 中“任务提交时写任务轮次、每个成功专业 Agent 分别写经验”的决定。
+- 决定：自动长期经验的唯一业务写入点是当前用户目标对应的 `MasterTask` 成功收口之后。平台由确定性服务聚合当前 TaskSpec revision、decomposition revision、成功 AgentRunResult、实际 Skill 和最终 Artifact，形成一条公开的 `CompletedTaskExperience`；不保存文档正文或模型隐藏推理。单个专业 Agent 完成和候选计划刚发布时均不得自动写入 Mem0。
+- 决定：每条完整经验使用 `task_id + TaskSpec revision + decomposition revision` 生成稳定 `experience_key`，并复用 PostgreSQL `api_requests` 保存写入中的幂等状态与最终回执。协调器、进程或网络重试不得产生第二条同轮经验。正式端仍以用户本轮 `remember_long_term` 授权为前提，测试端使用独立命名空间并可按既有配置自动授权；Mem0 失败不回滚成功任务。
+- 决定：写入前在同一 `user_id + app_id` 命名空间召回同类完整经验并启用重排。最高有效语义相似度不低于 `0.92` 时返回 `SKIPPED_DUPLICATE` 且不写入；不低于 `0.80` 且低于 `0.92` 时由代码按公开事实行去重，并通过 Mem0 Update API 原位更新命中记录，同时记录来源 Mem0 ID；低于 `0.80` 或没有候选时创建新经验。两个阈值分别由 `MEM0_DEDUP_THRESHOLD` 和 `MEM0_MERGE_THRESHOLD` 配置，后者必须小于前者。
+- 决定：历史 `agent_result` 和 `task_turn` 记录不从 Mem0 物理删除，但自动召回时过滤，不再注入总控或专业 Agent；用户明确授权写入的稳定偏好仍可正常召回。任务 JSONL 记录完整经验写入开始、创建/合并/跳过、相似度和供应商状态，不记录 Mem0 候选池或原始响应。
+- 原因：一次完整知识图谱任务可能由多个专业 Agent 和多次人工审核组成。逐 Agent、逐提交写入会把同一成功经验拆成大量缺乏最终目标与产物上下文的碎片，造成重复召回、噪声积累和额外网络延迟。成功后一次聚合可以保证经验完整、可追溯且易于幂等去重。
+- 明确不采用：每个专业 Agent 完成即写长期记忆；候选计划发布即写“成功经验”；把全部会话或 Artifact 正文上传 Mem0；新增记忆 Agent；用 LLM 判定写入阈值或幂等；语义相似项直接无条件追加；删除历史 Mem0 数据；Mem0 失败时回滚已成功的 MasterTask。
+
+## ADR-084：脚本 Skill 发布前必须通过受控依赖和契约试运行
+
+- 状态：已接受；细化 ADR-073、ADR-075 和 ADR-081 的脚本执行与 Contract Profile 边界。
+- 决定：继续使用独立、无网络、无业务凭证的长期运行 Script Runner 容器，并在其中为每次调用创建降权受限子进程；V1 不为每次 Skill 临时启动 Docker，也不允许脚本运行时在线安装依赖。Runner 镜像只预装版本固定的批准依赖集合；用户可上传 `requirements.txt`，但它只用于依赖检测，不触发安装。
+- 决定：含 Python 资源的 Skill 在发布前必须先执行静态 import/requirements 扫描，并使用当前 Contract Profile 的非空标准样例在隔离 Runner 中试运行。返回结果必须满足脚本响应协议、精确输出 Artifact 集合及对应 Pydantic 内容 Schema。检查结果写入 `custom_skill_contract_checks`，绑定 Skill revision、资源包 checksum、Contract Profile、运行环境 ID 和协议版本；任一绑定项变化后旧结果不可用于发布。
+- 决定：Runner 提供固定函数式入口；新脚本可实现 `run(inputs, parameters)` 并返回标准响应对象，无需自行处理 stdin/stdout。没有 `run` 的历史脚本继续使用原 JSON 标准输入输出协议。适配器不根据函数名或注解猜测业务契约，也不补造输出 Artifact。
+- 决定：发布服务只接受状态为 `PASSED` 且绑定当前全部事实的检查记录。依赖不受支持、导入高风险标准库、脚本异常、超时、自由文本输出、Artifact 类型不匹配或 Pydantic 校验失败时均拒绝发布；不得让不合法结果进入 SharedContext 或下游 Agent。
+- 原因：此前发布只验证 Python 语法，无法发现脚本期待的数据形状、缺失依赖和错误输出；Runner 同时使用 `-S` 禁用了全部第三方包，导致用户即使上传依赖声明也无法运行。发布前真实契约试运行可在任务执行前暴露这些问题，并保持业务用户不需要理解 Artifact 内部类型。
+- 明确不采用：在 API/Worker 宿主进程执行脚本；运行时 `pip install`；允许用户任意指定镜像；给 Runner 开放外网或业务密钥；仅凭模型推荐的 Contract Profile 直接发布；发布后等真实任务失败才发现契约不兼容；用 LLM 猜测或修复脚本代码及输入输出。
+
+## ADR-085：Skill 取消 LLM/SCRIPT 执行模式
+
+- 状态：已接受；替代 ADR-045 的模式切换设计，并进一步收紧 ADR-073、ADR-080 中仍将执行路径称为模式的表述。
+- 决定：Skill 是单一能力包，不存在 `LLM Skill`、`SCRIPT Skill` 或任务级 `SkillExecutionMode`。API、环境变量、SharedContext、AgentRunResult 和前端均不得提供或记录模式选择。专业 Agent 始终只按 Skill 名称调用；Registry 中每个 Skill 只绑定一个当前执行器。
+- 决定：执行器由已发布能力包的实际资源确定，而不是用户选择。内置目录存在 `implementation.py` 时加载专用代码；自定义能力包含已审核 Python 入口时进入隔离 Runner；其余 Skill 由专业 Agent 加载 `SKILL.md` 正文、输入 Artifact 投影和输出 Schema 后调用模型。资源变化必须形成新修订并重新通过既有发布校验。
+- 原因：`LLM/SCRIPT` 描述的是实现细节，不是 Skill 的业务分类。把它暴露为模式会让用户误以为同一 Skill 可任意切换两套能力，也会造成任务日志、API 参数与真实资源执行路径不一致。
+- 明确不采用：让用户或任务请求选择 Skill 模式；为同一个 Skill 同时注册多套可切换运行时；把是否有脚本写入业务元数据；在无脚本 Skill 和脚本 Skill 之间自动回退；因取消模式而放松权限、Artifact Schema、沙箱、人工审核或 PublishGuard。
+
+## ADR-086：聊天会话作为导航与删除边界
+
+- 状态：已接受；用户确认一个会话可以包含多个 MasterTask，删除入口位于会话菜单。
+- 决定：`Conversation` 保存稳定 ID、标题和时间，消息按 conversation_id 排序，最近五轮公开对话跨同一会话内的任务读取；每个 MasterTask 继续拥有独立 SharedContext。工作台左栏按会话展示，支持右键或菜单重命名、删除，任务详情可以在会话内切换。会话级 SSE 使用 PostgreSQL 全局事件序号推送所属 MasterTask 的已提交事件。
+- 决定：用户确认删除会话后，删除该会话私有消息、MasterTask、TaskSpec/拆解修订、Assignment、审核、运行结果、事件、普通 Artifact 和对应对象与任务日志。已正式发布的 PublishedOntology / PublishedGraph 与图谱关系投影保留在全局资产目录；为复用而生成的任务内导入副本不保留。已合并或被其他任务复用的 Mem0 完整经验保留，能精确确认供应商 ID 且未被合并的独立完整经验删除。清理云端或文件失败时接口返回告警。
+- 原因：用户按聊天会话管理历史，单一会话可能历经多个任务；只归档任务会让历史记录、文件与记忆继续堆积。已发布资产和合并经验有跨会话用途，不能随聊天删除而消失。
+- 明确不采用：左栏每个 MasterTask 占一项；把多个任务合并成一个 SharedContext；仅用 TASK_ARCHIVED 隐藏数据却宣称删除；把任务内导入副本当成正式发布资产；按会话批量删除 Mem0 命名空间；删除共享或已合并的长期记忆。
+
+## ADR-087：已发布资产目录操作不改写审核正文
+
+- 状态：已接受；明确会话删除与资产管理是两个独立操作边界。
+- 决定：会话删除保留正式 PublishedOntology / PublishedGraph。资产管理页可调整目录显示名称，不修改已审核 JSON、checksum 或血缘；用户确认“删除”后只将目录状态标为 `REMOVED`，使其退出新任务可选目录。Artifact 本身仍为 `AVAILABLE`，既有任务的引用和审计正文继续可用。修改本体或图谱内容必须另起候选版本、审核并发布，不能用目录名称编辑替代。
+- 原因：同一已发布版本可能被多个任务复用，直接覆盖或物理删除会破坏其输入血缘和历史结果。
+- 明确不采用：删除会话时顺带删除已发布资产；直接覆盖已发布 JSON；修改目录名时重写对象存储内容；把任务内导入副本当成正式资产；目录删除时级联破坏其他任务的历史引用。
+
+## ADR-088：自定义脚本字段映射使用不可变确认配置和确定性适配
+
+- 状态：已接受；细化 ADR-081、ADR-084，不新增 Agent 或 Artifact 类型。
+- 决定：脚本需要的名称与现有 Artifact 内容字段不同，不能仅凭名称由代码判断语义相同。创建阶段可提出候选映射，但必须由用户确认；确认的 `script_field + Artifact 类型 + JSON Pointer` 随 Skill 修订保存。运行时只按映射读取已校验 Artifact 内容，通过 `run(inputs, parameters)` 的 `parameters.input_fields` 提供别名；发布前试运行使用同一适配器。缺失必填字段或同类型来源不唯一时显式失败，不按列表顺序选择、不补造值。无映射的历史脚本继续使用原标准输入协议。
+- 决定：跨 Agent 的同类型变换产物根据父级血缘取代隐式旧输入，用户明确指定的旧 Artifact 保留；同一 Agent 的连续 Skill 同类型变换改用最新已持久化产物。正式输出仍按既有 ScriptCandidateResponse、Artifact Pydantic Schema 和真实 Artifact ID 绑定下游。
+- 原因：脚本字段名不一定等于 Artifact Schema 名称；仅做类型匹配无法确保脚本拿到所需字段，旧同类产物混入下游也可能导致错误选择。
+- 明确不采用：运行时让 LLM 猜字段、用空值替代必填输入、按时间或列表顺序随意选多个来源、让脚本创建自由 JSON Artifact、跳过发布前试运行。
+- 已实现：创建弹窗与管理页均可展示模型建议并让用户确认脚本字段来源；模型只读静态检测出的字段名和注册 Schema 候选，代码丢弃不在白名单中的建议，用户确认后生成新修订并重新试运行。
+- TODO：上游确实未抽取字段时的定向补字段任务尚未落地；不能宣称任意上传脚本都能自动适配。
+
+## ADR-089：自定义脚本补充数据与标准 Artifact 内容分离
+
+- 状态：已被 ADR-092 取代；下列内容仅保留历史决策记录，不再是当前实现约束。
+- 决定：标准 Artifact 内容继续使用已注册 Pydantic Schema。自定义脚本可返回标准 `outputs`；同类型单输出脚本返回普通 JSON 时，确定性适配器沿用唯一同类型输入的标准内容，并把原始脚本结果保存为新 Artifact 的独立附加对象。若脚本已返回标准输出，可在单项输出中附带 `extension_data`。附加对象按 Skill 稳定名称分区，记录修订和来源；同类型变换继承父级附加数据，旧 Artifact 不覆盖。
+- 决定：附加对象单独保存在对象存储，PostgreSQL 只保存定位、容量和轻量校验和；读写均验证结构、大小与 checksum。下游脚本获得 `inputs[].extensions`，已确认的显式字段映射可按命名空间和 JSON Pointer 读取；模型型 Skill 只接收有界附加数据投影。产物预览单独展示附加数据。脚本协议升级后须重新通过发布前试运行。
+- 原因：任意结果直接混入业务内容会绕过 Schema，也会让下游不知道字段含义；独立侧车保留原始结果与来源，同时不破坏既有标准 Artifact 的消费者。
+- 明确不采用：给所有业务内容加自由 `extra` 字段；覆盖旧 Artifact；不校验附加对象；让脚本绕过审批产生已发布资产；让模型在运行时猜测字段语义。
+- 决定：用户可通过受控接口确认脚本原始 JSON Pointer 到已注册输出 Artifact 顶层字段的映射；映射随不可变 Skill 修订保存，发布前试运行与正式执行共用。目标字段必须属于注册 Schema，重复目标与 schema_version 修改一律拒绝；异类型结果若仍缺必填字段，由 Pydantic 阻断。
+- 历史兼容：通用输出用途映射配置及已有修订仍可读取；ADR-090 后它不再进入新建 Skill 的默认交互流程。
+- TODO：附加字段作为下游输入时的业务化候选推荐、嵌套和多产物输出映射仍需完成。
+
+## ADR-090：主流程 Python Skill 先支持受限实体逐项适配
+
+- 状态：已接受；用户要求优先跑通有上下游的知识图谱主流程，收敛 ADR-089 的默认交互复杂度。
+- 决定：V1 首先在现有 `entity_transform` 契约中支持 `EntityDataset → 用户 Python 函数 → 新 EntityDataset`。创建时静态列出入口函数、唯一参数及字典返回键，由用户确认参数来自实体名称、结果键回填实体名称。适配配置随不可变 Skill 修订保存；发布前沙箱样例与正式执行走同一 Runner 入口。平台逐项调用函数并保留 entity_id、class_id、证据和原别名；名称改变时把原名称加入 aliases。标准输出仍经 Pydantic 校验并按父 Artifact 血缘交给下游。
+- 决定：新建 Skill 不得仅返回普通 JSON 而复制未改变的上游标准内容；必须返回标准 `outputs`、使用受限逐项适配或已有明确输出绑定。新建/管理界面不再自动进入通用普通 JSON 输出映射弹窗；标准字段映射 API 保留。独立附加对象的旧兼容路径由 ADR-092 撤销。
+- 原因：上游列表逐项提取与结果回填不能由现有单值 JSON Pointer 映射可靠完成；主流程需要真正的新标准产物，而不是只有附加字段。
+- 明确不采用：让脚本自行猜 Artifact 内部路径；运行时让模型判断字段语义；依赖列表位置或脚本返回值重写实体 ID；未经数据库核查直接删除可能被历史任务引用的数据。
+- TODO：关系、属性等其他逐项 Profile 和更加通用的脚本函数适配需单独验证，不宣称任意 Python 文件自动兼容。
+
+## ADR-091：已有 Python 脚本创建 Skill 时使用固定入口或受限生成适配入口
+
+- 状态：已接受；细化 ADR-084、ADR-090，不改变 Agent、Skill、Artifact、权限和隔离 Runner 架构。
+- 决定：用户上传的脚本若已有 `run(inputs, parameters)`，直接作为当前修订入口；实体逐项转换脚本若只有已确认的单参数业务函数，则保留原文件，并由服务端确定性生成独立的 `_kg_skill_entry.py`。生成入口与原脚本作为同一不可变修订资源保存，修订元数据显式绑定入口路径；发布前契约试运行和正式调用必须使用同一入口及资源 checksum。用户上传不得覆盖保留入口。
+- 决定：生成入口只读取唯一 `EntityDataset` 的实体名称，调用已确认函数，允许从已确认字典字段或函数直接返回的字符串取新名称；保留实体 ID、类型、证据和原别名，并生成新的标准 `EntityDataset`。标准输出继续经过脚本协议、精确类型、Pydantic Schema、Artifact 血缘和下游读取校验。无生成入口的历史逐项适配修订继续使用旧运行路径。
+- 原因：用户原脚本可能名为 `main.py` 且含 `main()`，不应被平台模板覆盖；已有脚本的函数签名和结果含义也不能仅凭名称自动判定。固定生成入口让一次确认在试运行和正式运行中保持一致。
+- 明确不采用：覆盖或改名用户原脚本；执行时调用模型猜输入输出；把任意 CLI `main()` 无条件当作可调用业务函数；把普通 JSON 侧车冒充主流程新 Artifact；为每种脚本另建运行时或新增 Agent。
+- 后续范围：关系、属性及其他 Contract Profile 的业务函数适配需各自验证模板；V1 不宣称任意 Python 脚本自动兼容。
+
+## ADR-092：撤销 Artifact 独立附加对象，统一标准产物交付
+
+- 状态：已接受；用户明确要求删除两个附加对象数据库字段及其相关机制。取代 ADR-089 的附加对象存储、读取和历史普通 JSON 兼容部分，不改变已确认的标准输入／输出字段映射。
+- 决定：自定义脚本必须返回 `outputs`、通过已确认字段映射生成标准内容，或经受限实体逐项适配生成标准 EntityDataset。普通 JSON 若没有输出字段绑定，直接失败；不能复制上游标准内容后把结果另存为独立附加对象。输入字段映射只读取 Artifact 标准内容，下游只按 Artifact ID、类型、Schema 和血缘读取标准产物。
+- 决定：删除附加对象契约、读写 API、MinIO 对象写入、前端预览和 PostgreSQL 定位／容量列。新迁移在删列前确认数据库中没有附加对象；若存在历史数据，停止迁移并先人工处理，不静默丢弃。保留旧 Alembic revision 作为不可改写的迁移历史。
+- 原因：V1 主流程需要能被下游直接消费的标准 Artifact；独立附加对象并不能代替契约对齐，反而增加存储、映射和故障面。正式库检查时没有任何已登记的附加对象，且当前已发布脚本通过标准输出契约检查。
+- 明确不采用：只删数据库列而保留查询代码；把无映射普通 JSON 当作成功结果；放宽 Pydantic Schema；删除旧迁移记录导致既有数据库无法升级。
+
+## ADR-093：已有脚本函数参数采用静态发现与人工确认的标准入口适配
+
+- 状态：已接受；扩展 ADR-091 的函数适配范围，不改变 Agent、Skill、Artifact、权限或隔离 Runner 架构。
+- 决定：仅精确的 `run(inputs, parameters)` 直接执行。其他顶层普通函数（包括 `run(payload)`）静态列出函数名和位置参数，由用户确认每个参数来自整份任务输入、全部标准 Artifact 输入或当前 Contract Profile 中已注册的 Artifact 内容字段。配置随 Skill 修订保存；平台生成独立的 `_kg_skill_entry.py`，原脚本不覆盖。发布前试运行和正式运行使用同一生成入口与资源包。实体单参数名称转换仍可使用 ADR-090 的保留身份逐项模板。
+- 决定：参数来源映射必须通过确定性白名单校验；缺失字段立即失败。返回内容仍须经标准 `outputs` 或已确认输出字段映射转换为现有 Artifact 契约，并通过 Pydantic 校验。通用函数适配只解决调用签名与输入传递，不推断业务函数语义，也不把任意输出自动变成合格产物。
+- 原因：旧逻辑把任意名为 `run` 的函数误判为双参数入口，`run(payload)` 直到沙箱执行才因参数个数报错；已有脚本应在发布前明确适配并给出可操作的错误信息。
+- 明确不采用：运行时试探参数组合；调用大模型猜测脚本接口并直接执行；任意 CLI `main()` 自动兼容；跳过 Artifact Schema；在宿主机执行用户脚本。
+
+## ADR-094：单产物完整内容可自动封装，部分输出须确认映射
+
+- 状态：已接受；细化 ADR-092 的“普通 JSON 不得冒充标准产物”边界，不恢复独立附加对象。
+- 决定：用户先确认现有 Contract Profile，即 Skill 的上下游位置。脚本输入函数参数可映射到完整任务包、全部上游 Artifact 列表、唯一上游 Artifact 的完整标准内容或该内容的已注册字段；静态读取键能与唯一上游内容字段精确对应时可预填完整内容来源，无法判断时必须人工选择。映射后通过沙箱试运行，不将来源建议视作已验证的事实。
+- 决定：脚本若返回标准 `outputs` 则照旧校验；若仅声明一个输出 Artifact 且普通 JSON 同时包含目标内容模型的全部业务字段，平台可在目标 Pydantic Schema 校验后补标准协议外壳。EntityDataset 同型转换无论使用标准输出、自动封装还是人工确认字段映射，均须保持输入实体 ID、类型和证据；部分结果、未知字段或多输出不能自动封装。
+- 决定：试运行发现非标准普通 JSON 时记录有界的顶层字段名、类型／列表结构及错误，不存原始业务值；创建页和管理页展示这些字段与已注册输出目标，由用户确认映射后产生新 Skill 修订并重新试运行。未映射字段不进入目标产物，界面须明确告知。映射后仍缺字段或不符合 Schema 时拒绝发布。测试端与正式端使用相同接口和归一化器。
+- 原因：用户脚本常返回完整内容却未包装 `outputs`；这属于可确定的协议差异。只返回局部字段则需要明确回填语义，不能假装已经产生完整下游产物。
+- 明确不采用：把任意字典自动当作产物；运行时用 LLM 猜字段；复制上游内容后把任意新增内容藏在侧车；跳过血缘或 Schema 校验；把缺失的上游信息补成空值。
+- TODO：通用列表逐项回填仍仅有实体名称转换专用适配；复杂嵌套、多产物及上游缺字段的定向补抽取需后续设计和验证。
+
+
+## ADR-095：函数入口与嵌套字段来源一次确认
+
+- 状态：已接受；细化 ADR-088、ADR-093、ADR-094，不改变 Agent、Skill 或 Artifact 架构。
+- 决定：创建或编辑脚本 Skill 时，静态分析用户确认的顶层函数实际读取的字面量字段路径，并只从所选 Contract Profile 的注册 Artifact 内容模型列举来源。唯一、同层的字段别名可预填建议；歧义与动态路径不得自动确认。函数参数来源与列表记录内部字段别名在同一界面确认，保存为同一不可变 Skill 修订。
+- 决定：嵌套映射只适用于参数选择唯一 Artifact 完整内容的情形；V1 仅支持同一列表记录内的字段别名，不移动列表、不合并实体、不补造值。生成入口只修改传给用户函数的深拷贝；沙箱试运行和正式执行共用该入口与绑定配置。原始 Artifact、输出 Schema、实体身份和证据完整性校验不变。
+- 原因：仅确认 `run(payload)` 的参数来源，不能解决脚本读取 `entities[*].id` 而标准内容提供 `entities[*].entity_id` 的失配；字段推荐必须基于上传代码及真实注册契约。
+- 明确不采用：运行时调用模型猜字段；直接改写用户脚本或原 Artifact；把字段改名当成实体合并语义；把试运行失败的脚本发布。
+- TODO：动态字段、跨层重组、多输入关联和脚本输出的实体合并语义仍需单独设计。
+
+## ADR-096：推荐脚本输出记录字段并转换为下游标准 Artifact
+
+- 状态：已接受；细化 ADR-094、ADR-095，不改变 Agent、Skill、Artifact 类型或审核门禁。
+- 决定：发布前沙箱试运行记录有界的脚本顶层与列表单项字段名；平台只从当前 Contract Profile 已注册的输出 Schema 推荐顶层和逐项字段对应关系，用户确认后随不可变 Skill 修订保存并重新试运行。正式执行与试运行共用确定性映射和 Pydantic 校验，下游只接收标准 Artifact。
+- 决定：同名及唯一别名先由代码推荐；剩余字段仅将本次上传脚本试运行观测到的有界字段形状、Skill 描述和已注册目标字段交给模型生成候选。代码丢弃不在观测与注册白名单内的建议，用户仍须在正式端确认；正式执行时不调用模型猜字段。
+- 决定：同型 EntityDataset 可凭相同实体 ID 从上游继承证据，但身份、类别和证据仍严格核对。脚本确实合并多个实体时，因关系和证据重定向尚无契约，拒绝把该结果作为普通字段映射发布。
+- 原因：固定别名只能覆盖少量脚本，无法判断任意上传脚本的业务返回字段；以真实试运行形状提出候选并交用户确认，才能扩展适配范围且不牺牲契约安全。
+- 明确不采用：运行时让模型猜测映射、补造缺失字段、忽略原实体血缘、把未经重定向的实体合并作为一对一改名放行。
+- TODO：实体真正合并时关系与证据的重定向语义、复杂嵌套和多产物输出映射需另行确认。
+
+## ADR-097：实体对齐生成结果不得以默认空列表伪装成功
+
+- 状态：已接受；修复正式端实体对齐丢失实体的缺陷，不改变历史 Artifact 存储契约。
+- 决定：LLM 新生成 EntityDataset 时必须显式返回 entities；align_entities 从权威输入 Artifact 读取完整实体事实，校验输出非空、entity_id 唯一、无合并时身份、类型和原有证据保留，并核对质量指标与实际数量。非法结果最多进行现有的一次结构化修复；仍不合法则 Skill 失败且不持久化新 Artifact。
+- 原因：2026-10-09 正式端任务 b2ca9f56-2556-41fc-b928-18f20539e581 的抽取结果有 5 个实体，模型只返回 schema_version，却在摘要中报告 5 个；历史内容模型将缺失 entities 默认补成空列表，导致后续收到 0 个实体。
+- 明确不采用：依赖模型摘要或 quality_signals 认定实体数；把输入实体静默复制为模型输出以掩盖失败；修改历史 Artifact Schema 导致旧数据不可读。
+- TODO：真实多实体合并时的关系和证据重定向语义仍需另行设计。
+
+## ADR-098：属性脚本非空保全与受控列表别名
+
+- 状态：已接受；细化 ADR-084、ADR-095、ADR-096，不改变 Agent、Skill、Artifact 类型或沙箱边界。
+- 决定：属性转换的契约试运行改用非空 PropertyDataset 样本；试运行与正式执行均核对输入输出属性 ID 集合、所属实体、属性类型和证据。非空输入变空输出、漏项或身份漂移必须失败，不产生新 Artifact。历史已发布空产物不自动改写。
+- 决定：普通函数适配除同一列表内字段别名外，允许用户确认单层列表别名及对应记录字段别名，例如 `/properties → /attributes`；来源只能是当前 Contract Profile 已注册字段，目标只能是脚本静态读取的字面量路径。生成入口仅在输入副本应用映射，修订、试运行和正式执行共用同一配置。跨列表记录字段必须先确认列表来源。
+- 决定：属性普通 JSON 的逐项输出若有已确认 `property_id` 对应关系，可按上游同 ID 属性继承类型与证据，仍需通过属性保全和 Pydantic 校验。正式创建弹窗与管理页都展示逐项输出映射；用户未确认的字段不补造。
+- 原因：2026-10-09 正式任务 a95f13ee-9079-4103-865a-0259e27e76bd 上游有 10 条属性，脚本的 `payload.attributes` 因错误参数来源为空，输出映射把 `normalized_attributes=[]` 写成正式 `properties=[]`，旧空样本与 Schema 校验均未阻断数据丢失。
+- 明确不采用：凭参数名 `payload` 断言脚本接收任务包；把空输出当作转换成功；运行时用模型猜映射；从不存在的单位字段编造单位；未经用户确认把完整上传代码发送给外部模型。
+- TODO：从证据原文提取单位、把规范值及单位共同编码到现有属性值的业务规则，需单独确认。完整脚本外发模型分析未获本轮安全审批，当前只做本地静态建议；若要启用须另行确认外发范围和目标服务。
+
+## ADR-099：已有脚本按必需路径预检并复用标准输出门禁
+
+- 状态：已接受；细化 ADR-093、ADR-095、ADR-098，不新增 Agent、Skill 模式、Artifact 类型或脚本运行时。
+- 决定：静态分析覆盖普通循环及列表、集合、字典推导式；方括号字面量读取视为必需路径，带默认值的 `get` 只作可选候选。创建弹窗和管理页显示已注册字段来源建议；后端保存函数适配修订前独立核对全部静态必需路径，缺失时返回具体路径，不让空映射进入沙箱。唯一同源列表的 ID／名称角色别名仅预填候选，仍由用户确认。
+- 决定：受控生成入口允许已有业务函数直接返回记录列表，仅包装为可观察的 `result` 字段；发布前仍必须经输出字段映射、非空样例、目标 Pydantic 契约及既有身份和证据门禁。原脚本不改写，试运行和正式执行使用同一修订入口。
+- 原因：已上传脚本即使参数来源选择正确，缺少内部字段别名时仍会在沙箱中以 KeyError 失败；推导式字段此前未被静态识别。普通列表返回也无法进入已有的输出映射观察流程。
+- 明确不采用：针对单个测试脚本硬编码对应关系；把名称相似当作已确认的语义；为缺失字段补造值；直接把原始列表当成正式 Artifact；未经授权将完整脚本发往外部模型。
+- TODO：动态键、复杂跨层重组、多输出与真实实体合并仍需独立设计和校验；本 ADR 不宣称任意 Python 脚本自动兼容。
+
+
+## ADR-100：脚本 Skill 输入与输出映射以可编辑模板确认
+
+- 状态：已接受；仅优化已有自定义 Skill 映射交互，不改变 Agent、Skill、Artifact 或 Runner 契约。
+- 决定：正式创建弹窗与 Skill 管理页把函数参数、脚本内部字段和脚本返回字段分别呈现为“脚本字段—平台字段—状态”的可编辑表格。系统建议仅预填；必需字段缺失时阻止保存，已选择映射仍须通过隔离试运行及目标 Artifact 校验。
+- 决定：已有草稿脚本可主动重新确认输入和输出映射；确认会产生新修订并使旧契约检查失效。候选只能来自当前 Contract Profile 的已注册输入字段、试运行实际观测的返回字段及已注册输出字段。
+- 原因：零散下拉框难以看清完整上下游字段关系，也无法直观区分建议、缺失与已确认配置；用户需要在管理页修正脚本映射，而不必反复删除重建 Skill。
+- 明确不采用：任意手填内部 Artifact 路径、把模型建议直接作为正式映射、自动补造不存在的数据、跳过沙箱或 Pydantic 校验。
+
+
+## ADR-101：自定义同型产物按字段继承，后续输入按血缘统一选取
+
+- 状态：已接受；细化 ADR-088、ADR-092、ADR-096，不新增 Artifact 类型或自由字段。
+- 决定：自定义 Skill 只替代其有父级血缘的同类型旧 Artifact；其他未覆盖类型的 Artifact 原样保留。Worker 加载输入与 AgentRunResult 提交校验必须使用同一套“先按全部候选血缘排除隐式旧版、再按 Agent 可接受类型筛选”的规则；用户显式指定的旧版仍保留。
+- 决定：唯一同型上游存在时，脚本标准输出中未明确提供的顶层标准字段从上游继承，明确返回的字段以脚本结果为准。已确认的逐项输出映射只在同一列表具有唯一稳定记录 ID、脚本逐项提供对应 ID 且未漏项时，继承该记录未改变的标准字段；完整结果继续经过既有 Pydantic Schema 和专门的身份、证据门禁。异型、多源或无稳定记录 ID 时，不按列表顺序猜测，也不自动补造字段。
+- 原因：自定义 EntityDataset 新版已经替代旧版，但冲突分析的 Worker 输入只含新版，结果提交校验却要求新旧两版，导致合法结果失败；字段映射也需要在不丢失既有信息的前提下支持其他标准 Artifact。
+- 明确不采用：把旧版和新版同型产物同时隐式交给下游；只对实体、关系或证据写特例；把自由新字段塞进 Artifact；绕过输出 Schema、人工审核或发布门禁。

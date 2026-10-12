@@ -1,0 +1,756 @@
+"""实现自定义脚本 Skill 的受控依赖扫描与沙箱契约试运行。
+
+本模块不在 API/Worker 进程执行用户代码。静态扫描只分析 AST 和 requirements 文本；
+动态检查通过现有无网络 Script Runner 使用精确的 Contract Profile 样例输入执行。
+"""
+
+from __future__ import annotations
+
+import ast
+import asyncio
+import base64
+import copy
+import json
+import os
+import re
+import sys
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+from time import monotonic
+from typing import Protocol, cast
+from uuid import uuid4
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from kg_agent.extensions.contract_profiles import SkillContractProfile
+from kg_agent.extensions.contracts import ScriptDependencyFinding
+from kg_agent.extensions.script_field_mapping import (
+    EntityRecordAdapter,
+    ScriptInputFieldBinding,
+    ScriptOutputFieldBinding,
+    project_script_input_fields,
+    read_json_pointer,
+)
+from kg_agent.extensions.script_signature import inspect_script_functions
+from kg_agent.registries.artifact_registry import ArtifactRegistry
+
+SCRIPT_RUNTIME_PROFILE_ID = "python-kg-v1"
+SCRIPT_PROTOCOL_VERSION = "1.2"
+_MAX_SCRIPT_JOB_BYTES = 12 * 1024 * 1024
+_APPROVED_PACKAGES = {
+    "jsonschema",
+    "networkx",
+    "numpy",
+    "openpyxl",
+    "pandas",
+    "pydantic",
+    "rapidfuzz",
+}
+_BLOCKED_STDLIB = {"ctypes", "multiprocessing", "resource", "socket", "subprocess"}
+_REQUIREMENT_NAME = re.compile(r"^\s*([A-Za-z0-9_.-]+)")
+
+
+class ScriptCandidateOutput(BaseModel):
+    """定义脚本标准响应中的一个候选 Artifact。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    artifact_type: str
+    content: dict[str, object]
+    content_summary: str = Field(min_length=1, max_length=500)
+
+
+class ScriptCandidateResponse(BaseModel):
+    """定义脚本标准输出协议；正式执行和发布前试运行共用此模型。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    outputs: list[ScriptCandidateOutput]
+    quality_signals: dict[str, float] = Field(default_factory=dict)
+
+
+def _merge_mapped_records(
+    source_records: object,
+    parent_records: object,
+    binding: ScriptOutputFieldBinding,
+) -> list[dict[str, object]]:
+    """按已确认的字段映射生成记录，并用稳定 ID 保留同型输入未改变的字段。
+
+    没有唯一同型来源时只形成脚本明确返回的字段，后续仍须通过目标 Pydantic
+    契约。已有记录若没有稳定 ID 或脚本漏项，不推测顺序，也不补造数据。
+    """
+
+    if not isinstance(source_records, list) or any(
+        not isinstance(item, dict) for item in source_records
+    ):
+        raise ValueError("逐项输出映射的脚本来源必须是对象列表")
+    parent_list = parent_records if isinstance(parent_records, list) else []
+    collection = binding.target_field
+    stem = (
+        collection[:-3] + "y"
+        if collection.endswith("ies")
+        else collection[:-2]
+        if collection.endswith("sses")
+        else collection[:-1]
+        if collection.endswith("s")
+        else collection
+    )
+    identity_field = f"{stem}_id"
+    if parent_list and (
+        any(
+            not isinstance(item, dict) or not isinstance(item.get(identity_field), str)
+            for item in parent_list
+        )
+        or len({item[identity_field] for item in parent_list}) != len(parent_list)
+    ):
+        raise ValueError(f"{collection} 上游记录没有唯一稳定 ID，不能逐项继承字段")
+    if parent_list and identity_field not in binding.record_field_bindings:
+        raise ValueError(f"{collection} 逐项输出映射必须包含 {identity_field}")
+    parents_by_id = {item[identity_field]: item for item in parent_list}
+    mapped_by_id: dict[str, dict[str, object]] = {}
+    mapped_records: list[dict[str, object]] = []
+    for item in source_records:
+        mapped: dict[str, object] = {}
+        for target_field, source_field in binding.record_field_bindings.items():
+            if source_field not in item:
+                raise ValueError(f"脚本返回记录缺少已确认字段 {source_field}")
+            mapped[target_field] = item[source_field]
+        if not parent_list:
+            mapped_records.append(mapped)
+            continue
+        if identity_field == "entity_id":
+            merged_ids = item.get("merged_ids")
+            if isinstance(merged_ids, list) and len(merged_ids) > 1:
+                raise ValueError("脚本合并多个实体需要关系及证据重定向，当前实体转换契约不支持")
+        record_id = mapped.get(identity_field)
+        if not isinstance(record_id, str) or record_id not in parents_by_id:
+            raise ValueError(f"脚本返回的 {identity_field} 无法对应上游记录")
+        if record_id in mapped_by_id:
+            raise ValueError(f"脚本重复返回 {identity_field}={record_id}")
+        record = copy.deepcopy(parents_by_id[record_id])
+        record.update(mapped)
+        mapped_by_id[record_id] = record
+    if parent_list:
+        if set(mapped_by_id) != set(parents_by_id):
+            raise ValueError(f"脚本遗漏 {collection} 上游记录，不能丢弃未处理的数据")
+        return [mapped_by_id[item[identity_field]] for item in parent_list]
+    return mapped_records
+
+
+def normalize_script_result(
+    result: object,
+    output_artifact_types: tuple[str, ...],
+    inputs: list[dict[str, object]],
+    output_bindings: tuple[ScriptOutputFieldBinding, ...] = (),
+    artifact_registry: ArtifactRegistry | None = None,
+) -> ScriptCandidateResponse:
+    """接受标准响应、可验证的完整单产物内容或已确认字段映射。"""
+
+    if not isinstance(result, dict):
+        raise ValueError("脚本结果必须是 JSON 对象")
+    if "outputs" in result:
+        parsed = ScriptCandidateResponse.model_validate(result)
+        for output in parsed.outputs:
+            # 标准 outputs 中未出现的顶层字段沿用唯一同型输入；显式返回的字段
+            # （包括空列表）仍以脚本结果为准。异型或多源产物不做猜测性继承。
+            parents = [item for item in inputs if item.get("artifact_type") == output.artifact_type]
+            if len(parents) != 1 or not isinstance(parents[0].get("content"), dict):
+                continue
+            parent_content = cast(dict[str, object], parents[0]["content"])
+            if "schema_version" in output.content and output.content[
+                "schema_version"
+            ] != parent_content.get("schema_version"):
+                raise ValueError("脚本不能修改同型 Artifact 的 schema_version")
+            output.content = {**copy.deepcopy(parent_content), **output.content}
+        return parsed
+    if not output_bindings:
+        if len(output_artifact_types) != 1 or artifact_registry is None:
+            raise ValueError("新脚本必须返回标准 outputs；普通 JSON 不能替代主流程产物")
+        output_type = output_artifact_types[0]
+        definition = artifact_registry.require(output_type)
+        model = definition.content_model
+        if model is None:
+            raise ValueError("该产物没有可自动封装的 JSON 内容契约")
+        business_fields = set(model.model_fields) - {"schema_version"}
+        present = business_fields.intersection(result)
+        if not present:
+            raise ValueError(
+                f"脚本返回字段与 {output_type} 标准内容不匹配；"
+                "请确认输出字段映射或让脚本返回标准 outputs"
+            )
+        missing = business_fields - set(result)
+        if missing:
+            raise ValueError(
+                f"脚本只返回了部分 {output_type} 内容，缺少字段 {sorted(missing)}；"
+                "请确认输出字段映射或返回完整内容"
+            )
+        # 只有完整业务字段通过目标 Schema 时才能补协议外壳，不能把自由 JSON
+        # 或半成品视作新 Artifact。实体同型转换还须保留上游身份与证据。
+        validated = artifact_registry.serialize_and_validate(
+            artifact_type=output_type,
+            schema_version=definition.schema_version,
+            content=result,
+        )
+        content = cast(dict[str, object], json.loads(validated))
+        if output_type == "EntityDataset":
+            parents = [item for item in inputs if item.get("artifact_type") == output_type]
+            if len(parents) == 1 and isinstance(parents[0].get("content"), dict):
+                original = cast(dict[str, object], parents[0]["content"])
+                old_entities = original.get("entities")
+                new_entities = content.get("entities")
+                if isinstance(old_entities, list) and isinstance(new_entities, list):
+                    old_by_id = {
+                        item["entity_id"]: item
+                        for item in old_entities
+                        if isinstance(item, dict) and isinstance(item.get("entity_id"), str)
+                    }
+                    new_by_id = {
+                        item["entity_id"]: item
+                        for item in new_entities
+                        if isinstance(item, dict) and isinstance(item.get("entity_id"), str)
+                    }
+                    if set(old_by_id) != set(new_by_id) or any(
+                        old_by_id[key].get("class_id") != new_by_id[key].get("class_id")
+                        or old_by_id[key].get("evidence") != new_by_id[key].get("evidence")
+                        for key in old_by_id
+                    ):
+                        raise ValueError(
+                            "实体转换结果未保留上游实体 ID、类型或证据；"
+                            "请使用逐项回填或返回完整且对应的实体列表"
+                        )
+        return ScriptCandidateResponse(
+            outputs=[
+                ScriptCandidateOutput(
+                    artifact_type=output_type,
+                    content=content,
+                    content_summary=f"脚本生成的 {output_type} 标准产物",
+                )
+            ]
+        )
+    if len(output_artifact_types) != 1:
+        raise ValueError("多个输出 Artifact 时脚本必须明确返回 outputs")
+    output_type = output_artifact_types[0]
+    matching = [item for item in inputs if item.get("artifact_type") == output_type]
+    if len(matching) == 1 and isinstance(matching[0].get("content"), dict):
+        standard_content = copy.deepcopy(cast(dict[str, object], matching[0]["content"]))
+    elif output_bindings:
+        # 异类型结果只能使用已确认的字段映射，缺失必填字段由目标 Pydantic Schema 阻断。
+        standard_content = {"schema_version": "1.0.0"}
+    else:
+        raise ValueError("异类型或不唯一输入不能自动继承标准内容，请返回标准 outputs")
+    for binding in output_bindings:
+        if binding.artifact_type != output_type:
+            raise ValueError("输出字段映射与声明的 Artifact 类型不一致")
+        try:
+            source_value = read_json_pointer(result, binding.source_pointer)
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ValueError(f"脚本输出字段 {binding.source_pointer} 不存在") from exc
+        if binding.record_field_bindings:
+            source_value = _merge_mapped_records(
+                source_value, standard_content.get(binding.target_field), binding
+            )
+        standard_content[binding.target_field] = source_value
+    return ScriptCandidateResponse(
+        outputs=[
+            ScriptCandidateOutput(
+                artifact_type=output_type,
+                content=standard_content,
+                content_summary="自定义脚本标准产物",
+            )
+        ]
+    )
+
+
+def validate_entity_transform_result(
+    inputs: list[dict[str, object]], parsed: ScriptCandidateResponse
+) -> None:
+    """同型实体变换须保留上游实体身份、类型和证据，不允许空结果误过门禁。"""
+
+    parents = [item for item in inputs if item.get("artifact_type") == "EntityDataset"]
+    outputs = [item for item in parsed.outputs if item.artifact_type == "EntityDataset"]
+    if len(parents) != 1 or len(outputs) != 1:
+        raise ValueError("实体转换需要唯一的输入和输出 EntityDataset")
+    original = parents[0].get("content")
+    if not isinstance(original, dict):
+        raise ValueError("实体转换输入缺少标准内容")
+    old_entities = original.get("entities")
+    new_entities = outputs[0].content.get("entities")
+    if not isinstance(old_entities, list) or not isinstance(new_entities, list):
+        raise ValueError("实体转换输入或输出缺少 entities 列表")
+    old_by_id = {
+        item["entity_id"]: item
+        for item in old_entities
+        if isinstance(item, dict) and isinstance(item.get("entity_id"), str)
+    }
+    new_by_id = {
+        item["entity_id"]: item
+        for item in new_entities
+        if isinstance(item, dict) and isinstance(item.get("entity_id"), str)
+    }
+    if (
+        len(old_by_id) != len(old_entities)
+        or len(new_by_id) != len(new_entities)
+        or set(old_by_id) != set(new_by_id)
+        or any(
+            old_by_id[key].get("class_id") != new_by_id[key].get("class_id")
+            or old_by_id[key].get("evidence") != new_by_id[key].get("evidence")
+            for key in old_by_id
+        )
+    ):
+        raise ValueError(
+            f"实体转换样例输入 {len(old_entities)} 个实体，脚本输出 {len(new_entities)} 个；"
+            "实体 ID、类型和证据必须保留。请检查输入参数来源与结果映射"
+        )
+
+
+def validate_property_transform_result(
+    inputs: list[dict[str, object]], parsed: ScriptCandidateResponse
+) -> None:
+    """属性同型转换须保留每条属性的身份和证据，禁止空输出掩盖错误映射。"""
+
+    parents = [item for item in inputs if item.get("artifact_type") == "PropertyDataset"]
+    outputs = [item for item in parsed.outputs if item.artifact_type == "PropertyDataset"]
+    if len(parents) != 1 or len(outputs) != 1:
+        raise ValueError("属性转换需要唯一的输入和输出 PropertyDataset")
+    original = parents[0].get("content")
+    if not isinstance(original, dict):
+        raise ValueError("属性转换输入缺少标准内容")
+    before = original.get("properties")
+    after = outputs[0].content.get("properties")
+    if not isinstance(before, list) or not isinstance(after, list):
+        raise ValueError("属性转换输入或输出缺少 properties 列表")
+    before_by_id = {
+        item["property_id"]: item
+        for item in before
+        if isinstance(item, dict) and isinstance(item.get("property_id"), str)
+    }
+    after_by_id = {
+        item["property_id"]: item
+        for item in after
+        if isinstance(item, dict) and isinstance(item.get("property_id"), str)
+    }
+    if (
+        len(before_by_id) != len(before)
+        or len(after_by_id) != len(after)
+        or set(before_by_id) != set(after_by_id)
+        or any(
+            before_by_id[key].get("entity_id") != after_by_id[key].get("entity_id")
+            or before_by_id[key].get("property_type_id") != after_by_id[key].get("property_type_id")
+            or before_by_id[key].get("evidence") != after_by_id[key].get("evidence")
+            for key in before_by_id
+        )
+    ):
+        raise ValueError(
+            f"属性转换输入 {len(before)} 条，脚本输出 {len(after)} 条；"
+            "属性 ID、所属实体、类型和证据必须保留。请检查脚本输入及输出映射"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ScriptContractValidationResult:
+    """返回可直接持久化的脚本检查结果。"""
+
+    passed: bool
+    dependency_findings: tuple[ScriptDependencyFinding, ...]
+    diagnostics: tuple[str, ...]
+    duration_ms: float
+    observed_output_fields: tuple[str, ...] = ()
+    observed_output_shapes: dict[str, str] | None = None
+
+
+def describe_script_output_shape(result: object) -> dict[str, str]:
+    """只公开有界字段类型与结构，不保存用户脚本返回的业务内容。"""
+
+    if not isinstance(result, dict):
+        return {}
+    shapes: dict[str, str] = {}
+    for key, value in list(result.items())[:64]:
+        if not isinstance(key, str):
+            continue
+        if isinstance(value, list):
+            shape = f"列表（{len(value)} 项）"
+            if value and isinstance(value[0], dict):
+                fields = [name[:64] for name in value[0] if isinstance(name, str)][:12]
+                shape += f"，单项字段：{', '.join(fields)}"
+        elif isinstance(value, dict):
+            fields = [name[:64] for name in value if isinstance(name, str)][:12]
+            shape = f"对象，字段：{', '.join(fields)}"
+        elif isinstance(value, str):
+            shape = "文本"
+        elif isinstance(value, bool):
+            shape = "布尔值"
+        elif isinstance(value, (int, float)):
+            shape = "数值"
+        elif value is None:
+            shape = "空值"
+        else:
+            shape = type(value).__name__
+        shapes[key[:128]] = shape
+    return shapes
+
+
+class ScriptRunnerClient(Protocol):
+    """抽象无网络 Runner 通信，便于生产与确定性测试使用同一校验流程。"""
+
+    async def execute(
+        self,
+        *,
+        entrypoint: str,
+        resources: tuple[tuple[str, bytes], ...],
+        input_payload: dict[str, object],
+        timeout_seconds: int,
+    ) -> dict[str, object]:
+        """执行一份不可变脚本包并返回 Runner 响应。"""
+
+
+class FilesystemScriptRunnerClient:
+    """通过只供应用和 Runner 共享的作业卷提交脚本请求。"""
+
+    def __init__(self, jobs_dir: str | None = None) -> None:
+        """绑定共享作业目录；为空时保留明确的不可用错误。"""
+
+        self._jobs_dir = (
+            jobs_dir if jobs_dir is not None else os.getenv("SCRIPT_RUNNER_JOBS_DIR", "")
+        )
+
+    async def execute(
+        self,
+        *,
+        entrypoint: str,
+        resources: tuple[tuple[str, bytes], ...],
+        input_payload: dict[str, object],
+        timeout_seconds: int,
+    ) -> dict[str, object]:
+        """原子写入请求并等待隔离 Runner 返回，绝不在调用进程执行脚本。"""
+
+        if not self._jobs_dir:
+            raise RuntimeError("未配置隔离脚本 Runner")
+        request = {
+            "entrypoint": entrypoint,
+            "resources": [
+                {"path": path, "content_base64": base64.b64encode(content).decode("ascii")}
+                for path, content in resources
+            ],
+            "timeout_seconds": min(max(timeout_seconds, 1), 300),
+            "input": input_payload,
+        }
+        serialized = json.dumps(request, ensure_ascii=False)
+        if len(serialized.encode("utf-8")) > _MAX_SCRIPT_JOB_BYTES:
+            raise ValueError("脚本作业输入与资源合计不能超过 12 MiB")
+        job = Path(self._jobs_dir) / str(uuid4())
+        job.mkdir(parents=True, mode=0o711)
+        job.chmod(0o711)
+        temporary = job / "request.tmp"
+        temporary.write_text(serialized, encoding="utf-8")
+        temporary.replace(job / "request.json")
+        response_path = job / "response.json"
+        deadline = monotonic() + min(max(timeout_seconds, 1), 300) + 10
+        while not response_path.exists() and monotonic() < deadline:
+            await asyncio.sleep(0.2)
+        if not response_path.exists():
+            raise TimeoutError("隔离 Runner 未及时返回")
+        response = json.loads(response_path.read_text(encoding="utf-8"))
+        (job / "ack").touch()
+        if not isinstance(response, dict):
+            raise ValueError("隔离 Runner 返回值不是 JSON 对象")
+        return response
+
+
+class ScriptContractValidator:
+    """在发布前验证依赖、Runner 可执行性和精确 Artifact 输出契约。"""
+
+    def __init__(self, artifact_registry: ArtifactRegistry, runner: ScriptRunnerClient) -> None:
+        """绑定 Artifact Schema 与隔离 Runner 客户端。"""
+
+        self._artifacts = artifact_registry
+        self._runner = runner
+
+    async def validate(
+        self,
+        *,
+        entrypoint: str,
+        resources: tuple[tuple[str, bytes], ...],
+        profile: SkillContractProfile,
+        timeout_seconds: int,
+        input_bindings: tuple[ScriptInputFieldBinding, ...] = (),
+        output_bindings: tuple[ScriptOutputFieldBinding, ...] = (),
+        entity_record_adapter: EntityRecordAdapter | None = None,
+    ) -> ScriptContractValidationResult:
+        """使用非空标准样例试运行脚本，并拒绝任何不受支持或不合法输出。"""
+
+        started = monotonic()
+        findings, diagnostics = self._scan_dependencies(resources)
+        if any(not item.supported for item in findings):
+            return ScriptContractValidationResult(
+                False, tuple(findings), tuple(diagnostics), (monotonic() - started) * 1000
+            )
+        if entity_record_adapter is None:
+            source = next((content for path, content in resources if path == entrypoint), None)
+            standard_entrypoint = False
+            if source is None:
+                diagnostics.append("脚本入口文件不存在")
+            else:
+                try:
+                    inspected = inspect_script_functions(source)
+                    standard_entrypoint = bool(inspected["standard_entrypoint"])
+                    if not standard_entrypoint:
+                        diagnostics.append(
+                            "脚本入口须为 run(inputs, parameters)；"
+                            "请在界面确认已有函数的参数来源并生成适配入口"
+                        )
+                except (UnicodeDecodeError, SyntaxError):
+                    diagnostics.append("脚本入口无法解析")
+            if not standard_entrypoint:
+                return ScriptContractValidationResult(
+                    False, tuple(findings), tuple(diagnostics), (monotonic() - started) * 1000
+                )
+        inputs = [self._fixture_input(item) for item in profile.input_artifact_types]
+        observed_output_fields: tuple[str, ...] = ()
+        observed_output_shapes: dict[str, str] = {}
+        try:
+            input_fields = project_script_input_fields(inputs, list(input_bindings))
+            response = await self._runner.execute(
+                entrypoint=entrypoint,
+                resources=resources,
+                input_payload={
+                    "inputs": inputs,
+                    "parameters": {
+                        "contract_check": True,
+                        "contract_profile_id": profile.profile_id,
+                        "input_fields": input_fields,
+                        **(
+                            {"entity_record_adapter": entity_record_adapter.model_dump(mode="json")}
+                            if entity_record_adapter
+                            else {}
+                        ),
+                    },
+                },
+                timeout_seconds=min(timeout_seconds, 30),
+            )
+            if "error_code" in response:
+                raise ValueError(
+                    f"{response.get('error_code')}: {response.get('error_message', '执行失败')}"
+                )
+            raw_result = response.get("result")
+            if isinstance(raw_result, dict) and "outputs" not in raw_result:
+                observed_output_fields = tuple(
+                    sorted(key for key in raw_result if isinstance(key, str))[:64]
+                )
+                observed_output_shapes = describe_script_output_shape(raw_result)
+            parsed = normalize_script_result(
+                raw_result,
+                profile.output_artifact_types,
+                inputs,
+                output_bindings,
+                self._artifacts,
+            )
+            if profile.profile_id == "entity_transform":
+                validate_entity_transform_result(inputs, parsed)
+            if profile.profile_id == "property_transform":
+                validate_property_transform_result(inputs, parsed)
+            actual = [item.artifact_type for item in parsed.outputs]
+            if len(actual) != len(set(actual)):
+                raise ValueError("脚本重复返回同一 Artifact 类型")
+            if set(actual) != set(profile.output_artifact_types):
+                raise ValueError(
+                    f"输出类型不匹配：应为 {list(profile.output_artifact_types)}，实际为 {actual}"
+                )
+            for item in parsed.outputs:
+                definition = self._artifacts.require(item.artifact_type)
+                self._artifacts.serialize_and_validate(
+                    artifact_type=item.artifact_type,
+                    schema_version=definition.schema_version,
+                    content=item.content,
+                )
+            diagnostics.append("沙箱试运行成功，输出已通过 Artifact Pydantic Schema 校验。")
+            if isinstance(raw_result, dict) and "outputs" not in raw_result and not output_bindings:
+                diagnostics.append("完整单产物内容已自动封装为标准 outputs。")
+            return ScriptContractValidationResult(
+                True,
+                tuple(findings),
+                tuple(diagnostics),
+                (monotonic() - started) * 1000,
+                observed_output_fields,
+                observed_output_shapes,
+            )
+        except Exception as exc:
+            diagnostics.append(f"沙箱契约试运行失败：{exc}")
+            return ScriptContractValidationResult(
+                False,
+                tuple(findings),
+                tuple(diagnostics),
+                (monotonic() - started) * 1000,
+                observed_output_fields,
+                observed_output_shapes,
+            )
+
+    def _scan_dependencies(
+        self, resources: tuple[tuple[str, bytes], ...]
+    ) -> tuple[list[ScriptDependencyFinding], list[str]]:
+        """扫描 Python import 和可选 requirements，且不安装任何用户依赖。"""
+
+        local_modules = {
+            PurePosixPath(path).parts[0] for path, _ in resources if path.lower().endswith(".py")
+        }
+        local_modules.update(
+            PurePosixPath(path).stem for path, _ in resources if path.lower().endswith(".py")
+        )
+        dependencies: dict[tuple[str, str], ScriptDependencyFinding] = {}
+        diagnostics: list[str] = []
+        for path, content in resources:
+            if path.lower().endswith(".py"):
+                tree = ast.parse(content.decode("utf-8"), filename=path)
+                for node in ast.walk(tree):
+                    name = ""
+                    if isinstance(node, ast.Import):
+                        for alias in node.names:
+                            self._record_import(alias.name, local_modules, dependencies)
+                        continue
+                    if isinstance(node, ast.ImportFrom) and node.level == 0:
+                        name = node.module or ""
+                    if name:
+                        self._record_import(name, local_modules, dependencies)
+            if PurePosixPath(path).name.lower() in {"requirements.txt", "requirements.lock"}:
+                for raw_line in content.decode("utf-8").splitlines():
+                    line = raw_line.split("#", 1)[0].strip()
+                    if not line:
+                        continue
+                    match = _REQUIREMENT_NAME.match(line)
+                    if match is None:
+                        dependencies[(line, "REQUIREMENTS")] = ScriptDependencyFinding(
+                            name=line,
+                            source="REQUIREMENTS",
+                            supported=False,
+                            reason="依赖声明格式不受支持",
+                        )
+                        continue
+                    name = match.group(1).lower().replace("_", "-")
+                    supported = name in {item.replace("_", "-") for item in _APPROVED_PACKAGES}
+                    dependencies[(name, "REQUIREMENTS")] = ScriptDependencyFinding(
+                        name=name,
+                        source="REQUIREMENTS",
+                        supported=supported,
+                        reason="受控运行环境已预装" if supported else "V1 运行环境未预装该依赖",
+                    )
+        findings = sorted(dependencies.values(), key=lambda item: (item.source, item.name))
+        if findings:
+            diagnostics.append(f"共识别 {len(findings)} 项外部依赖声明或导入。")
+        else:
+            diagnostics.append("未发现第三方依赖。")
+        return findings, diagnostics
+
+    @staticmethod
+    def _record_import(
+        name: str,
+        local_modules: set[str],
+        dependencies: dict[tuple[str, str], ScriptDependencyFinding],
+    ) -> None:
+        """把一个顶层 import 归类为本包模块、标准库、禁用库或批准依赖。"""
+
+        top = name.split(".", 1)[0]
+        if top in local_modules:
+            return
+        if top in _BLOCKED_STDLIB:
+            dependencies[(top, "IMPORT")] = ScriptDependencyFinding(
+                name=top, source="IMPORT", supported=False, reason="隔离环境禁止该高风险模块"
+            )
+            return
+        if top in sys.stdlib_module_names:
+            return
+        supported = top in _APPROVED_PACKAGES
+        dependencies[(top, "IMPORT")] = ScriptDependencyFinding(
+            name=top,
+            source="IMPORT",
+            supported=supported,
+            reason="受控运行环境已预装" if supported else "V1 运行环境未预装该依赖",
+        )
+
+    def _fixture_input(self, artifact_type: str) -> dict[str, object]:
+        """为受控 Profile 生成非空、可追溯且不依赖业务数据的标准输入。"""
+
+        artifact_id = uuid4()
+        source_id = uuid4()
+        pointer = {
+            "source_artifact_id": str(source_id),
+            "locator": "contract-check:sample",
+            "quote": "契约试运行样例",
+        }
+        contents: dict[str, dict[str, object]] = {
+            "SemanticDocument": {
+                "schema_version": "1.0.0",
+                "source_artifact_ids": [str(source_id)],
+                "segments": [
+                    {
+                        "segment_id": "sample-segment",
+                        "text": "设备 A 的温度为 80 摄氏度。",
+                        "evidence": [pointer],
+                        "metadata": {},
+                    }
+                ],
+            },
+            "EntityDataset": {
+                "schema_version": "1.0.0",
+                "entities": [
+                    {
+                        "entity_id": "entity-a",
+                        "name": "设备 A",
+                        "class_id": "equipment",
+                        "aliases": [],
+                        "evidence": [pointer],
+                    },
+                    {
+                        "entity_id": "entity-b",
+                        "name": "液压泵总成",
+                        "class_id": "equipment",
+                        "aliases": [],
+                        "evidence": [pointer],
+                    },
+                ],
+            },
+            "RelationDataset": {"schema_version": "1.0.0", "relations": []},
+            "PropertyDataset": {
+                "schema_version": "1.0.0",
+                "properties": [
+                    {
+                        "property_id": "sample-height",
+                        "entity_id": "entity-a",
+                        "property_type_id": "height",
+                        "value": 1.75,
+                        "evidence": [pointer],
+                    }
+                ],
+            },
+            "EvidenceDataset": {"schema_version": "1.0.0", "evidence": []},
+            "StructuredDataset": {
+                "schema_version": "1.0.0",
+                "columns": ["name", "value"],
+                "rows": [{"name": "设备 A", "value": 80}],
+            },
+            "PublishedGraph": {
+                "schema_version": "1.0.0",
+                "entities": [],
+                "relations": [],
+                "properties": [],
+                "evidence": [],
+                "publication_title": "契约试运行图谱",
+                "graph_id": str(uuid4()),
+                "graph_version": "contract-check",
+                "approval_artifact_id": str(uuid4()),
+            },
+        }
+        content = contents.get(artifact_type)
+        if content is None:
+            raise ValueError(f"尚未为 {artifact_type} 配置契约试运行样例")
+        definition = self._artifacts.require(artifact_type)
+        normalized = json.loads(
+            self._artifacts.serialize_and_validate(
+                artifact_type=artifact_type,
+                schema_version=definition.schema_version,
+                content=content,
+            )
+        )
+        return {
+            "artifact_id": str(artifact_id),
+            "artifact_type": artifact_type,
+            "content": normalized,
+        }

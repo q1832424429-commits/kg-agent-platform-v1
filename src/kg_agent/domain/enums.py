@@ -1,0 +1,128 @@
+"""集中定义项目已经冻结的业务状态枚举。"""
+
+from enum import StrEnum
+
+
+class TaskIntent(StrEnum):
+    """用户对总任务的顶层操作意图。"""
+
+    START = "START"
+    CONTINUE = "CONTINUE"
+    MODIFY = "MODIFY"
+
+
+class SubTaskStatus(StrEnum):
+    """AgentSubTask 在协作过程中的状态。"""
+
+    PENDING = "PENDING"
+    BLOCKED = "BLOCKED"
+    READY = "READY"
+    ASSIGNED = "ASSIGNED"
+    CLAIMED = "CLAIMED"
+    RUNNING = "RUNNING"
+    WAITING_HUMAN = "WAITING_HUMAN"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+    SUPERSEDED = "SUPERSEDED"
+
+
+class AgentRunStatus(StrEnum):
+    """专业 Agent 一次运行的业务结果。"""
+
+    SUCCESS = "SUCCESS"
+    PARTIAL_SUCCESS = "PARTIAL_SUCCESS"
+    NEEDS_USER_INPUT = "NEEDS_USER_INPUT"
+    RETRYABLE_FAILED = "RETRYABLE_FAILED"
+    REWORK_REQUIRED = "REWORK_REQUIRED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
+class AssignmentMode(StrEnum):
+    """子任务分配方式；V1 由总控 Agent 明确指定负责角色。"""
+
+    DIRECT = "DIRECT"
+
+
+class ReviewTargetType(StrEnum):
+    """人工审核目标。"""
+
+    ONTOLOGY = "ONTOLOGY"
+    GRAPH = "GRAPH"
+
+
+class ReviewOption(StrEnum):
+    """Human Review API 未来支持的用户操作。"""
+
+    APPROVE = "APPROVE"
+    REJECT = "REJECT"
+    SUBMIT_CHANGES = "SUBMIT_CHANGES"
+
+
+class MasterTaskStatus(StrEnum):
+    """MasterTask 的确定性生命周期状态。"""
+
+    ACTIVE = "ACTIVE"
+    WAITING_USER = "WAITING_USER"
+    WAITING_HUMAN = "WAITING_HUMAN"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
+class AssignmentStatus(StrEnum):
+    """AgentAssignment 一次执行尝试的租约与执行状态。"""
+
+    PENDING = "PENDING"
+    CLAIMED = "CLAIMED"
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    EXPIRED = "EXPIRED"
+    CANCELLED = "CANCELLED"
+
+
+class ArtifactStatus(StrEnum):
+    """Artifact 元数据在 V1 中允许的生命周期状态。"""
+
+    AVAILABLE = "AVAILABLE"
+    INVALIDATED = "INVALIDATED"
+    SUPERSEDED = "SUPERSEDED"
+
+
+class HumanReviewStatus(StrEnum):
+    """HumanReviewRequest 的确定性处理状态。"""
+
+    PENDING = "PENDING"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
+    CHANGES_REQUESTED = "CHANGES_REQUESTED"
+    CANCELLED = "CANCELLED"
+
+
+class TaskEventType(StrEnum):
+    """第二阶段持久化的任务审计事件类型。"""
+
+    MASTER_TASK_CREATED = "MASTER_TASK_CREATED"
+    MASTER_TASK_STATUS_CHANGED = "MASTER_TASK_STATUS_CHANGED"
+    TASK_SPEC_REVISED = "TASK_SPEC_REVISED"
+    DECOMPOSITION_PUBLISHED = "DECOMPOSITION_PUBLISHED"
+    SUBTASK_PUBLISHED = "SUBTASK_PUBLISHED"
+    SUBTASK_STATUS_CHANGED = "SUBTASK_STATUS_CHANGED"
+    ASSIGNMENT_CREATED = "ASSIGNMENT_CREATED"
+    ASSIGNMENT_CLAIMED = "ASSIGNMENT_CLAIMED"
+    ASSIGNMENT_STARTED = "ASSIGNMENT_STARTED"
+    ASSIGNMENT_HEARTBEAT = "ASSIGNMENT_HEARTBEAT"
+    ASSIGNMENT_EXPIRED = "ASSIGNMENT_EXPIRED"
+    ASSIGNMENT_COMPLETED = "ASSIGNMENT_COMPLETED"
+    CONTEXT_VERSION_CREATED = "CONTEXT_VERSION_CREATED"
+    ARTIFACT_CREATED = "ARTIFACT_CREATED"
+    ARTIFACT_STATUS_CHANGED = "ARTIFACT_STATUS_CHANGED"
+    HUMAN_REVIEW_REQUESTED = "HUMAN_REVIEW_REQUESTED"
+    HUMAN_REVIEW_RESOLVED = "HUMAN_REVIEW_RESOLVED"
+    TASK_ARCHIVED = "TASK_ARCHIVED"
+    # 兼容曾由 8002 写入数据库的旧版“发布后审核”事件。新两阶段计划审核只使用
+    # 隔离草稿日志，不再新增这两类 TaskEvent，但读取历史任务时仍必须可反序列化。
+    PLAN_REVIEW_REQUESTED = "PLAN_REVIEW_REQUESTED"
+    PLAN_REVIEW_RESOLVED = "PLAN_REVIEW_RESOLVED"

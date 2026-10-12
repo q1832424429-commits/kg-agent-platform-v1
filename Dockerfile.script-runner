@@ -1,0 +1,24 @@
+# 单独构建无业务依赖的脚本隔离执行器；不复制 .env、数据库配置或应用凭证。
+# 构建参数仅供离线 CI 复用已有 Python 基础层；正式构建保持精简官方镜像默认值。
+ARG SCRIPT_RUNNER_BASE_IMAGE=python:3.12-slim
+FROM ${SCRIPT_RUNNER_BASE_IMAGE}
+# 兼容使用本地应用镜像作为离线基础层时遗留的虚拟环境前缀；正式 slim 基础镜像
+# 也使用同一系统 site-packages，不改变批准依赖的可见范围。
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    SCRIPT_RUNNER_JOBS_DIR=/jobs \
+    PYTHONPATH=/usr/local/lib/python3.12/site-packages
+WORKDIR /runner
+# V1 只提供这一组经过平台批准的固定依赖；用户上传 requirements 仅用于发布前核验，
+# Runner 在任务执行期间无网络，也不会动态 pip install。
+RUN pip install --no-cache-dir \
+    jsonschema==4.23.0 \
+    networkx==3.4.2 \
+    numpy==2.2.6 \
+    openpyxl==3.1.5 \
+    pandas==2.2.3 \
+    pydantic==2.11.7 \
+    rapidfuzz==3.12.2
+COPY src/kg_agent/extensions/script_runner.py /runner/script_runner.py
+COPY src/kg_agent/extensions/script_entry.py /runner/script_entry.py
+CMD ["python", "/runner/script_runner.py"]

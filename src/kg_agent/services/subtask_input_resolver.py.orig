@@ -1,0 +1,97 @@
+"""根据 AgentSubTask 依赖关系解析执行时实际可用的 Artifact 输入。
+
+总控一次发布完整 Agent 级计划时，后续子任务尚不知道上游将生成的 Artifact ID。
+本模块只在依赖成功后沿不可变 AgentRunResult 血缘绑定真实 ID，不规划任务、不选择
+Skill，也不允许跨任务读取 Artifact。
+"""
+
+from uuid import UUID
+
+from kg_agent.domain.artifact_models import ArtifactRef
+from kg_agent.domain.enums import AgentRunStatus
+from kg_agent.domain.task_models import AgentSubTask
+from kg_agent.repositories.interfaces import AgentRunRepository, TaskRepository
+
+
+async def resolve_candidate_input_ids(
+    *,
+    subtask: AgentSubTask,
+    tasks: TaskRepository,
+    runs: AgentRunRepository,
+) -> list[UUID]:
+    """返回显式输入、全部依赖祖先输出及审核 Approval 的候选 ID。
+
+    返回值仍需由调用方按照目标 Agent 的 ``accepted_input_types`` 过滤。发布任务所需
+    Approval 由 HumanReviewService 产生，不属于某个专业 Agent 输出，因此按当前任务
+    和 Approval 类型安全补入候选集合。
+    """
+
+    ancestor_ids = await _ancestor_subtask_ids(subtask, tasks)
+    result_ids: set[UUID] = set(subtask.input_artifact_ids)
+    # 上游任务显式复用的稳定输入（例如 PublishedOntology）也沿依赖链传递；否则关系
+    # 抽取只能得到实体输出，却会丢失实体抽取使用的本体版本。
+    for ancestor_id in ancestor_ids:
+        ancestor = await tasks.get_subtask(ancestor_id)
+        if ancestor is not None:
+            result_ids.update(ancestor.input_artifact_ids)
+    for result in await runs.list_results(subtask.master_task_id):
+        if result.subtask_id in ancestor_ids and result.status is AgentRunStatus.SUCCESS:
+            result_ids.update(result.output_artifact_ids)
+
+    approval_type = {
+        "ontology_publish": "OntologyApproval",
+        "graph_publish": "GraphApproval",
+    }.get(subtask.subtask_type)
+    if approval_type is not None:
+        for artifact in await tasks.list_artifact_refs(subtask.master_task_id):
+            if artifact.artifact_type == approval_type:
+                result_ids.add(artifact.artifact_id)
+    return sorted(result_ids, key=str)
+
+
+def discard_superseded_ancestor_inputs(
+    refs: list[ArtifactRef], *, explicit_ids: set[UUID]
+) -> list[ArtifactRef]:
+    """移除已被同类型后代替代的隐式输入，保留用户明确选择的 Artifact。
+
+    仅根据正式 Artifact 父级血缘判断；无血缘关系的同类文档仍能并行输入。
+    """
+
+    by_id = {ref.artifact_id: ref for ref in refs}
+    superseded: set[UUID] = set()
+    for descendant in refs:
+        pending = list(descendant.parent_artifact_ids)
+        visited: set[UUID] = set()
+        while pending:
+            parent_id = pending.pop()
+            if parent_id in visited:
+                continue
+            visited.add(parent_id)
+            parent = by_id.get(parent_id)
+            if parent is None:
+                continue
+            if parent.artifact_type == descendant.artifact_type:
+                superseded.add(parent_id)
+            pending.extend(parent.parent_artifact_ids)
+    return [
+        ref for ref in refs if ref.artifact_id not in superseded or ref.artifact_id in explicit_ids
+    ]
+
+
+async def _ancestor_subtask_ids(
+    subtask: AgentSubTask,
+    tasks: TaskRepository,
+) -> set[UUID]:
+    """迭代读取直接和间接依赖，异常环由发布前 Validator 负责拒绝。"""
+
+    ancestors: set[UUID] = set()
+    pending = list(subtask.dependency_subtask_ids)
+    while pending:
+        subtask_id = pending.pop()
+        if subtask_id in ancestors:
+            continue
+        ancestors.add(subtask_id)
+        dependency = await tasks.get_subtask(subtask_id)
+        if dependency is not None:
+            pending.extend(dependency.dependency_subtask_ids)
+    return ancestors

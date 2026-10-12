@@ -1,0 +1,14 @@
+# 排除本地状态、密钥、测试和文档，减小生产构建上下文。
+.git
+.venv
+__pycache__
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.env
+*.pyc
+tests
+evaluation
+docs
+# 运行日志由 Compose 单独挂载，不属于镜像构建输入；容器创建的只读文件也不应阻断构建。
+logs

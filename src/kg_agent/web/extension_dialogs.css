@@ -1,0 +1,59 @@
+/* 自定义能力弹窗：由正式端与测试端共同使用，不引入第二套前端框架或状态容器。 */
+.extension-open-button {
+  padding: 7px 11px;
+  border: 1px solid var(--border-strong, rgba(70, 234, 186, .32));
+  border-radius: 8px;
+  background: var(--accent-soft, rgba(70, 234, 186, .09));
+  color: var(--accent, #46eaba);
+  font-size: 12px;
+  font-weight: 800;
+  cursor: pointer;
+}
+.extension-open-button:hover { filter: brightness(1.16); }
+.extension-dialog { width: min(760px, calc(100vw - 32px)); max-height: 88vh; overflow: auto; }
+.extension-dialog-card { padding: 20px; }
+.extension-dialog-card h2 { margin: 5px 0 12px; font-size: 21px; }
+.extension-dialog-card p { margin: 0 0 12px; }
+.extension-choice-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin: 18px 0 4px; }
+.extension-choice-button { min-height: 118px; padding: 16px; border: 1px solid var(--border-strong, rgba(70, 234, 186, .28)); border-radius: 12px; background: var(--panel-soft, rgba(70, 234, 186, .07)); color: var(--text, #ecf7f4); text-align: left; cursor: pointer; }
+.extension-choice-button:hover { border-color: var(--accent, #46eaba); }
+.extension-choice-button strong, .extension-choice-button span { display: block; }
+.extension-choice-button strong { margin-bottom: 7px; color: var(--accent, #46eaba); font-size: 14px; }
+.extension-choice-button span { color: var(--muted, #809b96); font-size: 11px; line-height: 1.55; }
+/* 管理入口横跨整行，清楚区分“新建能力”和“管理已有能力”两种动作。 */
+.extension-choice-button.is-management { grid-column: 1 / -1; min-height: 86px; }
+.extension-field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.extension-dialog-card label { display: block; margin: 14px 0 7px; color: var(--muted, #b8ccc7); font-size: 12px; font-weight: 700; }
+.extension-dialog-card input, .extension-dialog-card textarea, .extension-dialog-card select { width: 100%; margin-top: 6px; padding: 9px 10px; border: 1px solid var(--border, rgba(153, 205, 196, .13)); border-radius: 9px; outline: 0; background: var(--panel, #071310); color: var(--text, #ecf7f4); }
+.extension-dialog-card textarea { resize: vertical; line-height: 1.55; }
+.extension-dialog-card input:focus, .extension-dialog-card textarea:focus, .extension-dialog-card select:focus { border-color: var(--border-strong, rgba(70, 234, 186, .3)); }
+.extension-resource-details { margin-top: 15px; padding: 10px; border: 1px solid var(--border, rgba(153, 205, 196, .13)); border-radius: 9px; }
+.extension-resource-details summary { color: var(--muted, #809b96); font-size: 12px; cursor: pointer; }
+.extension-dialog-card fieldset { margin-top: 14px; border: 1px solid var(--border, rgba(153, 205, 196, .13)); border-radius: 9px; }
+.extension-dialog-card legend { color: var(--muted, #b8ccc7); font-size: 12px; font-weight: 700; }
+.extension-skill-options { max-height: 190px; overflow: auto; }
+.extension-skill-options label { display: flex; align-items: flex-start; gap: 8px; margin: 8px 0; font-weight: 500; }
+.extension-skill-options input[type="checkbox"] { width: auto; margin: 2px 0 0; }
+.extension-preview-materials { display: grid; gap: 10px; margin: 16px 0; }
+.extension-preview-materials section { padding: 11px 12px; border: 1px solid var(--border, rgba(153, 205, 196, .13)); border-radius: 9px; background: var(--panel-soft, rgba(70, 234, 186, .05)); }
+.extension-preview-materials strong { display: block; margin-bottom: 5px; color: var(--accent, #46eaba); font-size: 12px; }
+.extension-preview-materials p { margin: 0; color: var(--text, #ecf7f4); font-size: 13px; line-height: 1.55; white-space: pre-wrap; }
+
+@media (max-width: 720px) {
+  .extension-choice-list, .extension-field-grid { grid-template-columns: 1fr; }
+}
+
+/* 脚本字段映射模板：在窄屏横向滚动，保留每项建议与缺失状态。 */
+.extension-mapping-section { min-width: 0; }
+.extension-mapping-scroll { overflow-x: auto; }
+.extension-mapping-table { width: 100%; min-width: 540px; border-collapse: collapse; font-size: 12px; }
+.extension-mapping-table th, .extension-mapping-table td { padding: 9px 8px; border-bottom: 1px solid var(--border, rgba(153, 205, 196, .13)); text-align: left; vertical-align: middle; }
+.extension-mapping-table th { color: var(--muted, #b8ccc7); font-weight: 700; }
+.extension-mapping-table td:first-child { width: 30%; overflow-wrap: anywhere; }
+.extension-mapping-table td:nth-child(2) { width: 50%; }
+.extension-mapping-table select { margin: 0; min-width: 170px; }
+.extension-mapping-status { width: 20%; font-weight: 700; }
+.extension-mapping-status[data-state="missing"] { color: #ffb1a8; }
+.extension-mapping-status[data-state="pending"] { color: var(--accent, #46eaba); }
+.extension-mapping-status[data-state="optional"] { color: var(--muted, #b8ccc7); }
+.extension-mapping-note { color: var(--muted, #b8ccc7); font-size: 11px; line-height: 1.45; }

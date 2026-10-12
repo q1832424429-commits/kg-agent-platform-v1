@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <!-- 工作台基础元数据：页面不依赖外部字体或前端 CDN，便于离线部署。 -->
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="知识图谱构建 Agent 平台任务工作台" />
+    <title>图谱 Agent 工作台</title>
+    <link rel="stylesheet" href="/workbench-assets/app.css?v=20260929-5" />
+    <link rel="stylesheet" href="/workbench-assets/extension_dialogs.css?v=20261010-1" />
+  </head>
+  <body>
+    <!-- 顶栏展示产品身份、后端连通状态和当前任务。 -->
+    <header class="topbar">
+      <div class="brand-mark" aria-hidden="true">KG</div>
+      <div class="brand-copy">
+        <strong>图谱 Agent 工作台</strong>
+        <span>知识图谱构建 · V1</span>
+      </div>
+      <div class="topbar-spacer"></div>
+      <span id="api-status" class="status-pill status-checking">正在连接</span>
+      <!-- 生产工作台只增加紧凑进度组件，不改变原有三栏布局和操作方式。 -->
+      <div id="task-progress" class="task-progress" hidden>
+        <div class="task-progress-copy">
+          <strong id="task-progress-value">0%</strong>
+          <span id="task-progress-stage">等待任务</span>
+        </div>
+        <div class="task-progress-track" aria-label="任务完成百分比">
+          <span id="task-progress-bar"></span>
+        </div>
+      </div>
+      <span id="current-task-label" class="task-label">尚未选择任务</span>
+      <select id="conversation-task-select" class="conversation-task-select" aria-label="查看会话中的任务" hidden></select>
+      <!-- 已发布资产与任务内 Artifact 分开管理，避免用户把复用副本误认为新发布版本。 -->
+      <a class="extension-open-button" href="/published-assets">已发布资产</a>
+      <!-- 一个入口先选择创建类型，再显示对应的受控定义表单。 -->
+      <button id="open-extension-button" class="extension-open-button" type="button">自定义能力</button>
+    </header>
+
+    <div class="workspace-shell">
+      <!-- 左栏以聊天会话为单位管理历史；同一会话可以包含多个业务任务。 -->
+      <aside class="task-sidebar" aria-label="会话列表">
+        <button id="new-task-button" class="primary-button full-width" type="button">
+          <span aria-hidden="true">＋</span> 新建会话
+        </button>
+        <button id="new-task-in-conversation-button" class="secondary-button full-width" type="button" hidden>在当前会话开启新任务</button>
+        <div class="sidebar-heading">
+          <span>最近会话</span>
+          <button id="refresh-tasks-button" class="icon-button" type="button" aria-label="刷新会话列表">↻</button>
+        </div>
+        <div id="task-list" class="task-list">
+          <div class="empty-state compact">暂无会话</div>
+        </div>
+        <div id="conversation-menu" class="conversation-menu" hidden></div>
+      </aside>
+
+      <!-- 中间区域是主要工作面：查看本轮结果并提交问题或文件。 -->
+      <main class="conversation-panel">
+        <section id="welcome-card" class="welcome-card">
+          <span class="eyebrow">开始构建</span>
+          <h1>描述你想从资料中构建什么知识</h1>
+          <p>输入任务目标并上传文档。总控 Agent 会识别意图、拆解子任务并分配给专业 Agent。</p>
+          <div class="example-row" aria-label="任务示例">
+            <button class="example-chip" type="button">从设备手册构建设备故障知识图谱</button>
+            <button class="example-chip" type="button">先解析文档并抽取候选实体</button>
+          </div>
+        </section>
+
+        <section id="conversation" class="conversation-stream" aria-live="polite"></section>
+
+        <form id="composer" class="composer">
+          <!-- 普通文档与外部本体分别展示，避免用户把两种业务输入混在同一窗口。 -->
+          <div id="file-tray" class="file-tray" hidden></div>
+          <div class="published-asset-row">
+            <label>复用已发布本体
+              <select id="published-ontology-select"><option value="">不选择</option></select>
+            </label>
+            <label>图谱增量基线
+              <select id="published-graph-select"><option value="">不选择</option></select>
+            </label>
+            <button id="refresh-assets-button" class="icon-button" type="button" aria-label="刷新已发布资产">↻</button>
+          </div>
+          <label for="message-input" class="sr-only">输入知识图谱构建任务</label>
+          <textarea
+            id="message-input"
+            rows="3"
+            placeholder="例如：解析这些设备手册，建立制造业设备故障本体并构建候选图谱……"
+            required
+          ></textarea>
+          <div class="composer-actions">
+            <label class="secondary-button file-button" for="file-input">
+              <span aria-hidden="true">⌁</span> 上传文件
+            </label>
+            <input
+              id="file-input"
+              type="file"
+              accept=".pdf,.docx,.xlsx,.pptx,.jpg,.jpeg,.png,.tif,.tiff,.webp"
+              multiple
+              hidden
+            />
+            <label class="secondary-button file-button ontology-button" for="ontology-input">
+              <span aria-hidden="true">◇</span> 上传本体 JSON
+            </label>
+            <input
+              id="ontology-input"
+              type="file"
+              accept=".json,application/json"
+              hidden
+            />
+            <span id="composer-mode" class="composer-mode">新建任务</span>
+            <button id="send-button" class="primary-button" type="submit">发送任务</button>
+          </div>
+        </form>
+      </main>
+
+      <!-- 右栏以标签页展示 Agent 可观测信息，不暴露模型隐藏思维过程。 -->
+      <aside class="inspector" aria-label="任务执行详情">
+        <nav class="tabs" aria-label="详情分类">
+          <button class="tab is-active" data-tab="route" type="button">路由</button>
+          <button class="tab" data-tab="artifacts" type="button">产物</button>
+          <button class="tab" data-tab="reviews" type="button">审核</button>
+          <button class="tab" data-tab="events" type="button">轨迹</button>
+        </nav>
+        <div id="inspector-content" class="inspector-content">
+          <div class="empty-state">
+            <div class="empty-icon" aria-hidden="true">◎</div>
+            <strong>等待任务</strong>
+            <span>提交任务后，这里会展示意图、Agent 分配和 Skill 执行结果。</span>
+          </div>
+        </div>
+      </aside>
+    </div>
+
+    <!-- 审核对话框支持批准、拒绝以及提交结构化 ChangeSet。 -->
+    <dialog id="review-dialog" class="review-dialog">
+      <form method="dialog" class="dialog-card">
+        <div class="dialog-heading">
+          <div>
+            <span class="eyebrow">Human Review</span>
+            <h2>审核候选知识</h2>
+          </div>
+          <button class="icon-button" value="cancel" aria-label="关闭审核窗口">×</button>
+        </div>
+        <div id="review-materials" class="review-materials"></div>
+        <label id="review-title-label" for="review-title">发布名称（批准时必填）</label>
+        <input id="review-title" maxlength="120" placeholder="例如：汽车制造设备故障本体 V1" />
+        <label id="review-feedback-label" for="review-feedback">审核说明</label>
+        <textarea id="review-feedback" rows="3" placeholder="拒绝时请写明原因；批准时可选。"></textarea>
+        <!-- 图谱编辑器内部使用 ChangeSet；本体修改由自然语言建议生成，不向用户暴露 JSON。 -->
+        <label id="review-operations-label" for="review-operations" hidden>修改操作</label>
+        <textarea id="review-operations" class="code-input" rows="7" hidden>[]</textarea>
+        <div id="review-actions" class="dialog-actions">
+          <button id="reject-review-button" class="danger-button" type="button">拒绝</button>
+          <button id="changes-review-button" class="secondary-button" type="button">提交修改</button>
+          <button id="approve-review-button" class="primary-button" type="button">批准</button>
+        </div>
+      </form>
+    </dialog>
+
+    <!-- 最终结果与右栏中间产物共用只读弹窗；不修改 Artifact 原文。 -->
+    <dialog id="artifact-dialog" class="review-dialog artifact-dialog">
+      <div class="dialog-card">
+        <div class="dialog-heading"><h2 id="artifact-dialog-title">查看产物</h2><button id="close-artifact-dialog" class="icon-button" type="button" aria-label="关闭产物预览">×</button></div>
+        <div id="artifact-dialog-content" class="artifact-dialog-content"></div>
+      </div>
+    </dialog>
+
+    <!-- 全局消息条集中呈现请求成功和错误，不打断用户当前输入。 -->
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+    <!-- 固定版本的 G6 本地托管，工作台不依赖公网 CDN。 -->
+    <script src="/workbench-assets/vendor/g6-5.1.1.min.js" defer></script>
+    <!-- 图谱预览组件先加载，工作台脚本再把 Artifact/审核数据接入同一组件。 -->
+    <script src="/workbench-assets/graph_view.js" defer></script>
+    <script src="/workbench-assets/app.js?v=20260929-4" defer></script>
+    <script src="/workbench-assets/extension_dialogs.js?v=20261010-1" defer></script>
+  </body>
+</html>

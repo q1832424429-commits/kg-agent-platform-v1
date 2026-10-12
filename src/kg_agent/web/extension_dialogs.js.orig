@@ -1,0 +1,862 @@
+/**
+ * 自定义 Agent / Skill 的共享弹窗控制器。
+ *
+ * 正式端和测试端均只放置一个 #open-extension-button。脚本负责依次展示能力选择、
+ * Skill 表单和 Agent 表单，并调用当前同源服务的受控定义包 API；因此两个端口
+ * 自然写入各自的数据库，不会在前端携带环境标识或跨端口请求。
+ */
+
+"use strict";
+
+/** 把逗号分隔的表单值规范为后端 Pydantic 契约要求的字符串数组。 */
+function extensionCsv(value) {
+  return String(value || "").split(",").map((item) => item.trim()).filter(Boolean);
+}
+
+/** 使用页面原有 toast 呈现结果；页面尚未提供时降级为浏览器提示。 */
+function extensionNotice(message, isError = false) {
+  const toast = document.querySelector("#toast");
+  if (!toast) {
+    window.alert(message);
+    return;
+  }
+  toast.textContent = message;
+  toast.classList.toggle("is-error", isError);
+  toast.hidden = false;
+  window.setTimeout(() => { toast.hidden = true; }, 4500);
+}
+
+/** 请求当前页面所属环境的定义包 API，并把业务错误转换成用户可读文本。 */
+async function extensionApi(path, options = {}) {
+  const response = await fetch(path, options);
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload.message || payload.detail || `HTTP ${response.status}`);
+  return payload;
+}
+
+/** 返回不含用户输入插值的固定弹窗结构，避免通过动态模板引入 HTML 注入。 */
+function extensionDialogsMarkup() {
+  return `
+    <dialog id="extension-choice-dialog" class="review-dialog extension-dialog">
+      <form class="extension-dialog-card" method="dialog">
+        <div class="dialog-heading"><div><span class="eyebrow">CUSTOM EXTENSION</span><h2>自定义能力</h2></div><button class="dialog-close icon-button" value="cancel" aria-label="关闭">×</button></div>
+        <p class="field-note">选择要新增的能力类型。创建内容只会在当前端口的后续新任务中被发现。</p>
+        <div class="extension-choice-list">
+          <button class="extension-choice-button" type="button" data-extension-choice="skill"><strong>新增自定义 Skill</strong><span>定义输入、输出、执行说明，可选择捆绑资源。</span></button>
+          <button class="extension-choice-button" type="button" data-extension-choice="agent"><strong>新增自定义 Agent</strong><span>定义职责、可接任务和可调用 Skill 权限。</span></button>
+          <button class="extension-choice-button is-management" type="button" data-extension-choice="manage"><strong>管理已创建的能力</strong><span>查看当前环境内的自定义 Agent 与 Skill，并按类型进入管理页面。</span></button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="extension-management-choice-dialog" class="review-dialog extension-dialog">
+      <form class="extension-dialog-card" method="dialog">
+        <div class="dialog-heading"><div><span class="eyebrow">EXTENSION MANAGEMENT</span><h2>选择管理内容</h2></div><button class="dialog-close icon-button" value="cancel" aria-label="关闭">×</button></div>
+        <p class="field-note">管理页面只显示当前端口内创建的能力；正式端与测试端数据彼此隔离。</p>
+        <div class="extension-choice-list">
+          <button class="extension-choice-button" type="button" data-extension-manage="agents"><strong>Agent 管理</strong><span>查看自定义 Agent 的职责、状态和允许调用的 Skill 权限。</span></button>
+          <button class="extension-choice-button" type="button" data-extension-manage="skills"><strong>Skill 管理</strong><span>查看自定义 Skill 的契约、状态、资源与发布记录。</span></button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="extension-skill-dialog" class="review-dialog extension-dialog">
+      <form id="extension-skill-form" class="extension-dialog-card">
+        <div class="dialog-heading"><div><span class="eyebrow">CUSTOM SKILL</span><h2>新增自定义 Skill</h2></div><button class="dialog-close icon-button" type="button" data-extension-close aria-label="关闭">×</button></div>
+        <p class="field-note">只需描述业务能力。系统会自动处理文档解析、内部数据契约和运行方式；提交后先生成草稿，确认后才发布。</p>
+        <label>能力名称<input name="name" required placeholder="例如：设备故障分析" /></label>
+        <label>它要解决什么问题<textarea name="solves_problem" rows="3" required placeholder="例如：从设备维修资料中归纳故障现象、原因和处理建议。"></textarea></label>
+        <label>适用什么资料<textarea name="applicable_materials" rows="2" required placeholder="例如：设备手册、维修记录、故障报告。"></textarea></label>
+        <label>希望得到什么结果<textarea name="expected_result" rows="3" required placeholder="例如：按故障现象、可能原因、处理建议和原文依据输出结果。"></textarea></label>
+        <label>典型用户提问<textarea name="example_request" rows="2" required placeholder="例如：请分析这份维修手册中的常见故障。"></textarea></label>
+        <label>补充要求（可选）<textarea name="additional_requirements" rows="3" placeholder="例如：只分析电机相关内容；不要构建或发布图谱。"></textarea></label>
+        <details class="extension-resource-details"><summary>可选脚本或捆绑资源</summary><label>单文件包内路径（多文件时使用各自文件名）<input name="resource_path" placeholder="main.py 或 references/domain.md" /></label><label>资源文件<input name="resource" type="file" multiple /></label><p class="field-note">已有 run(inputs, parameters) 的脚本直接试运行；实体转换也可上传已有的单参数函数，确认函数和结果后由平台生成独立适配入口，原 main.py 不会被覆盖。其他脚本仍须返回标准 outputs；发布前均在隔离环境试运行。</p><button type="button" class="secondary-button" id="download-entity-script-template">下载实体名称标准化脚本示例</button></details>
+        <div class="dialog-actions"><button class="secondary-button" type="button" data-extension-close>取消</button><button class="primary-button" type="submit">生成草稿</button></div>
+      </form>
+    </dialog>
+    <dialog id="extension-agent-dialog" class="review-dialog extension-dialog">
+      <form id="extension-agent-form" class="extension-dialog-card">
+        <div class="dialog-heading"><div><span class="eyebrow">CUSTOM AGENT</span><h2>新增自定义 Agent</h2></div><button class="dialog-close icon-button" type="button" data-extension-close aria-label="关闭">×</button></div>
+        <p class="field-note">请选择它能够调用的已发布 Skill。系统会自动推导该 Agent 可接收的任务和处理资料；提交后先生成草稿，确认后才发布。</p>
+        <label>Agent 名称<input name="name" required placeholder="例如：设备故障分析 Agent" /></label>
+        <label>它负责什么工作<textarea name="responsibility" rows="3" required placeholder="例如：负责分析设备资料中的故障现象、原因和处理建议。"></textarea></label>
+        <label>适合在什么场景使用<textarea name="applicable_scenarios" rows="2" required placeholder="例如：用户要求从设备手册或维修记录中生成故障分析结果。"></textarea></label>
+        <label>典型用户提问<textarea name="example_request" rows="2" required placeholder="例如：请根据上传资料分析设备故障。"></textarea></label>
+        <fieldset><legend>允许调用的 Skill（可多选）</legend><div id="extension-agent-skill-options" class="extension-skill-options"><span class="field-note">正在读取 Skill 目录…</span></div></fieldset>
+        <div class="dialog-actions"><button class="secondary-button" type="button" data-extension-close>取消</button><button class="primary-button" type="submit">生成草稿</button></div>
+      </form>
+    </dialog>
+    <dialog id="extension-preview-dialog" class="review-dialog extension-dialog">
+      <form class="extension-dialog-card" method="dialog">
+        <div class="dialog-heading"><div><span class="eyebrow">CAPABILITY DRAFT</span><h2>确认能力草稿</h2></div><button class="dialog-close icon-button" value="cancel" aria-label="关闭">×</button></div>
+        <p class="field-note">以下是业务化预览。内部任务类型、Artifact 和运行实现已由系统校验，不需要你填写。</p>
+        <div id="extension-preview-materials" class="extension-preview-materials"></div>
+        <div class="dialog-actions"><button class="secondary-button" type="button" data-extension-close>暂不发布</button><button id="extension-publish-draft-button" class="primary-button" type="button">确认发布</button></div>
+      </form>
+    </dialog>`;
+}
+
+/** 绑定一次性通用创建流；页面重新加载后由浏览器重新初始化。 */
+function initializeExtensionDialogs() {
+  const trigger = document.querySelector("#open-extension-button");
+  if (!trigger || document.querySelector("#extension-choice-dialog")) return;
+  document.body.insertAdjacentHTML("beforeend", extensionDialogsMarkup());
+  const choiceDialog = document.querySelector("#extension-choice-dialog");
+  const managementChoiceDialog = document.querySelector("#extension-management-choice-dialog");
+  const skillDialog = document.querySelector("#extension-skill-dialog");
+  const agentDialog = document.querySelector("#extension-agent-dialog");
+  const previewDialog = document.querySelector("#extension-preview-dialog");
+  const skillForm = document.querySelector("#extension-skill-form");
+  const agentForm = document.querySelector("#extension-agent-form");
+  const skillOptions = document.querySelector("#extension-agent-skill-options");
+  const previewMaterials = document.querySelector("#extension-preview-materials");
+  const publishDraftButton = document.querySelector("#extension-publish-draft-button");
+  const templateButton = document.querySelector("#download-entity-script-template");
+  templateButton.addEventListener("click", () => {
+    const source = [
+      "# 平台会逐个传入实体名称，并保留实体 ID、类型和证据。",
+      "def normalize(device_name):",
+      "    standard_name = device_name.replace('液压泵总成', '液压泵')",
+      "    return {'standard_name': standard_name}",
+      "",
+    ].join("\n");
+    const url = URL.createObjectURL(new Blob([source], { type: "text/x-python;charset=utf-8" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "main.py";
+    document.body.append(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  });
+  let pendingDraft = null;
+
+  /** 从后端权威目录生成多选框；只显示业务名称，内部 key 仅作为权限 YAML 的提交值。 */
+  const loadSkillOptions = async () => {
+    const options = await extensionApi("/api/v1/extensions/skill-options");
+    skillOptions.replaceChildren();
+    for (const option of options) {
+      const label = document.createElement("label");
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.name = "allowed_skill_names";
+      checkbox.value = option.name;
+      const text = document.createElement("span");
+      text.textContent = `${option.display_name || option.name} · ${option.description}`;
+      label.append(checkbox, text);
+      skillOptions.append(label);
+    }
+    if (!options.length) skillOptions.textContent = "暂无可选 Skill，请先发布一个自定义 Skill。";
+  };
+
+  const open = (dialog) => {
+    if (typeof dialog.showModal !== "function") return extensionNotice("当前浏览器不支持弹窗，请升级浏览器后重试。", true);
+    dialog.showModal();
+  };
+
+  /** 以纯文本渲染业务化草稿预览，避免把用户描述插入 HTML。 */
+  const showDraftPreview = (draft) => {
+    pendingDraft = draft;
+    previewMaterials.replaceChildren();
+    for (const [label, value] of draft.items) {
+      const block = document.createElement("section");
+      const heading = document.createElement("strong");
+      const content = document.createElement("p");
+      heading.textContent = label;
+      content.textContent = value;
+      block.append(heading, content);
+      previewMaterials.append(block);
+    }
+    if (draft.contractProposal) {
+      const block = document.createElement("section");
+      const heading = document.createElement("strong");
+      heading.textContent = "能力使用方式（可修改）";
+      const select = document.createElement("select");
+      select.id = "extension-contract-profile-select";
+      for (const option of draft.contractProposal.alternatives) {
+        const element = document.createElement("option");
+        element.value = option.profile_id;
+        element.textContent = `${option.business_name} · ${option.suggested_position}`;
+        element.selected = option.profile_id === draft.contractProposal.selected.profile_id;
+        select.append(element);
+      }
+      const hint = document.createElement("p");
+      hint.className = "field-note";
+      const refreshHint = () => {
+        const selected = draft.contractProposal.alternatives.find((item) => item.profile_id === select.value);
+        hint.textContent = selected
+          ? `接收：${selected.input_description}；交付：${selected.output_description}。系统只会使用已注册的安全契约。`
+          : "系统只会使用已注册的安全契约；修改这里不会要求你填写内部数据类型。";
+      };
+      select.addEventListener("change", refreshHint);
+      refreshHint();
+      block.append(heading, select, hint);
+      previewMaterials.append(block);
+    }
+    open(previewDialog);
+  };
+  /** 将候选字段渲染为可编辑映射表；建议值仍须用户确认并通过沙箱试运行。 */
+  const createMappingTable = (title, sourceTitle = "脚本字段", targetTitle = "平台字段") => {
+    const section = document.createElement("section");
+    section.className = "extension-mapping-section";
+    const heading = document.createElement("strong");
+    heading.textContent = title;
+    const scroll = document.createElement("div");
+    scroll.className = "extension-mapping-scroll";
+    const table = document.createElement("table");
+    table.className = "extension-mapping-table";
+    const head = document.createElement("thead");
+    const header = document.createElement("tr");
+    for (const caption of [sourceTitle, targetTitle, "状态"]) {
+      const cell = document.createElement("th");
+      cell.textContent = caption;
+      header.append(cell);
+    }
+    head.append(header);
+    const body = document.createElement("tbody");
+    table.append(head, body);
+    scroll.append(table);
+    section.append(heading, scroll);
+    return { section, body };
+  };
+
+  /** 来源限于平台注册或试运行观测字段，空值不能补造缺失数据。 */
+  const appendMappingRow = (body, field, select, { required = true, suggested = "", note = "" } = {}) => {
+    const row = document.createElement("tr");
+    const name = document.createElement("td");
+    name.textContent = field;
+    const target = document.createElement("td");
+    select.setAttribute("aria-label", `${field} 对应字段`);
+    target.append(select);
+    const state = document.createElement("td");
+    state.className = "extension-mapping-status";
+    const refresh = () => {
+      const missing = !select.value;
+      state.dataset.state = missing ? (required ? "missing" : "optional") : "pending";
+      state.textContent = missing
+        ? (required ? "缺失，需处理" : "未映射")
+        : (select.value === suggested ? "系统建议，待确认" : "已选择，待试运行");
+    };
+    select.addEventListener("change", refresh);
+    refresh();
+    row.append(name, target, state);
+    body.append(row);
+    if (note) {
+      const explanation = document.createElement("tr");
+      const cell = document.createElement("td");
+      cell.colSpan = 3;
+      cell.className = "extension-mapping-note";
+      cell.textContent = note;
+      explanation.append(cell);
+      body.append(explanation);
+    }
+  };
+  /** 用户只需选择脚本字段对应的业务资料；内部路径留在选项值中，不要求手填。 */
+  const showScriptMapping = (proposal) => {
+    previewMaterials.replaceChildren();
+    const intro = document.createElement("p");
+    intro.className = "field-note";
+    intro.textContent = "脚本需要读取以下内容。系统仅给出建议，请确认来源；无法找到对应资料时先修改脚本或上游抽取。";
+    const mapping = createMappingTable("输入字段映射", "脚本需要", "来自已有资料");
+    previewMaterials.append(intro, mapping.section);
+    for (const field of proposal.detected_fields) {
+      const select = document.createElement("select");
+      select.dataset.scriptField = field;
+      const empty = document.createElement("option");
+      empty.value = "";
+      empty.textContent = "请选择已有资料字段";
+      select.append(empty);
+      const suggestion = proposal.suggested_bindings.find((item) => item.script_field === field);
+      for (const source of proposal.source_fields) {
+        const option = document.createElement("option");
+        option.value = JSON.stringify([source.artifact_type, source.source_pointer]);
+        option.textContent = source.business_label;
+        option.selected = Boolean(
+          suggestion
+          && suggestion.artifact_type === source.artifact_type
+          && suggestion.source_pointer === source.source_pointer
+        );
+        select.append(option);
+      }
+      appendMappingRow(mapping.body, field, select, {
+        suggested: suggestion ? JSON.stringify([suggestion.artifact_type, suggestion.source_pointer]) : "",
+        note: !suggestion ? "没有可靠建议。若资料确实缺少该数据，请调整上游抽取或脚本。" : "",
+      });
+    }
+    pendingDraft.kind = "skill-mapping";
+    publishDraftButton.textContent = "确认字段来源并发布";
+  };
+
+  /** 仅为实体转换脚本展示逐项函数适配；用户确认后才保存修订。 */
+  const prepareEntityAdapter = async () => {
+    if (pendingDraft.profileId !== "entity_transform") return false;
+    const proposal = await extensionApi(
+      `/api/v1/extensions/skills/${encodeURIComponent(pendingDraft.id)}/entity-adapter-proposal`,
+      { method: "POST" },
+    );
+    if (proposal.standard_entrypoint) return false;
+    if (!proposal.functions.length) {
+      throw new Error("实体转换脚本需要一个只接收一个参数的处理函数");
+    }
+    previewMaterials.replaceChildren();
+    const intro = document.createElement("p");
+    intro.className = "field-note";
+    intro.textContent = "平台逐个传入实体名称，保留实体 ID、类型和证据；请选择脚本函数及其返回的标准名称字段。";
+    const functionSelect = document.createElement("select");
+    functionSelect.id = "extension-entity-function";
+    const resultSelect = document.createElement("select");
+    resultSelect.id = "extension-entity-result";
+    for (const item of proposal.functions) {
+      const option = document.createElement("option");
+      option.value = JSON.stringify([item.function_name, item.parameter_name, item.result_fields]);
+      option.textContent = `${item.function_name}(${item.parameter_name})`;
+      functionSelect.append(option);
+    }
+    const refreshResults = () => {
+      const [, , fields] = JSON.parse(functionSelect.value);
+      resultSelect.replaceChildren();
+      for (const field of fields) {
+        const option = document.createElement("option");
+        option.value = field;
+        option.textContent = field === "__value__" ? "函数直接返回名称字符串" : field;
+        resultSelect.append(option);
+      }
+    };
+    functionSelect.addEventListener("change", refreshResults);
+    refreshResults();
+    const fallback = document.createElement("label");
+    fallback.textContent = "若返回字段没有列出，请填写脚本返回的字段名";
+    const customField = document.createElement("input");
+    customField.id = "extension-entity-custom-result";
+    customField.placeholder = "例如 standard_name";
+    fallback.append(customField);
+    previewMaterials.append(intro, functionSelect, resultSelect, fallback);
+    pendingDraft.kind = "skill-entity-adapter";
+    publishDraftButton.textContent = "确认适配并试运行";
+    return true;
+  };
+
+  /** 为已有任意普通函数展示参数来源确认，不在运行时猜参数含义。 */
+  const prepareFunctionAdapter = async () => {
+    const proposal = await extensionApi(
+      `/api/v1/extensions/skills/${encodeURIComponent(pendingDraft.id)}/function-adapter-proposal`,
+      { method: "POST" },
+    );
+    if (proposal.standard_entrypoint) return false;
+    if (!proposal.functions.length) {
+      throw new Error("脚本没有标准 run(inputs, parameters)，也未发现可适配的顶层函数");
+    }
+    previewMaterials.replaceChildren();
+    const note = document.createElement("p");
+    note.className = "field-note";
+    note.textContent = "请选择业务函数，并确认每个参数来自整份输入、全部产物或指定标准字段。";
+    const functionSelect = document.createElement("select");
+    functionSelect.id = "extension-function-name";
+    for (const item of proposal.functions) {
+      const option = document.createElement("option");
+      option.value = item.function_name;
+      option.textContent = `${item.function_name}(${item.parameters.join(", ")})`;
+      functionSelect.append(option);
+    }
+    const argumentBox = document.createElement("div");
+    argumentBox.id = "extension-function-arguments";
+    const fieldBox = document.createElement("div");
+    fieldBox.id = "extension-function-fields";
+    const refresh = () => {
+      argumentBox.replaceChildren();
+      const selected = proposal.functions.find((item) => item.function_name === functionSelect.value);
+      const parameters = createMappingTable("函数参数映射", "脚本参数", "上游内容");
+      argumentBox.append(parameters.section);
+      for (const parameter of selected.parameters) {
+        const select = document.createElement("select");
+        select.dataset.parameter = parameter;
+        const empty = document.createElement("option");
+        empty.value = "";
+        empty.textContent = "请选择脚本参数需要的内容";
+        select.append(empty);
+        for (const [value, title] of [
+          ["TASK_PAYLOAD", "当前任务与全部上游资料"],
+          ["INPUTS", "全部上游产物列表"],
+          ...(proposal.input_artifact_types || []).map((artifactType) => [
+            JSON.stringify(["CONTENT", artifactType]),
+            `完整上游内容（${proposal.input_description || artifactType}）`,
+          ]),
+          ...(proposal.source_fields || []).map((item) => [
+            JSON.stringify([item.artifact_type, item.source_pointer]),
+            `${item.business_label}（来自上游资料）`,
+          ]),
+        ]) {
+          const option = document.createElement("option");
+          option.value = value;
+          option.textContent = title;
+          select.append(option);
+        }
+        const suggestion = proposal.suggested_bindings
+          ?.find((item) => item.function_name === selected.function_name)
+          ?.arguments.find((item) => item.parameter_name === parameter);
+        if (suggestion?.source === "ARTIFACT_FIELD") {
+          select.value = JSON.stringify([suggestion.artifact_type, suggestion.source_pointer]);
+        } else if (suggestion?.source === "ARTIFACT_CONTENT") {
+          select.value = JSON.stringify(["CONTENT", suggestion.artifact_type]);
+        } else if (suggestion?.source) {
+          select.value = suggestion.source;
+        }
+        appendMappingRow(parameters.body, parameter, select, { suggested: select.value });
+      }
+      fieldBox.replaceChildren();
+      const nested = createMappingTable("脚本内部字段映射", "脚本读取", "上游已有字段");
+      const artifactType = proposal.input_artifact_types?.[0];
+      if (artifactType && Object.keys(selected.field_reads || {}).length) {
+        fieldBox.append(nested.section);
+        for (const [parameter, paths] of Object.entries(selected.field_reads || {})) {
+          const targets = paths.filter((path) =>
+            path.includes("*") || paths.some((other) => other.startsWith(path + "/*/"))
+          );
+          for (const target of targets) {
+            const collection = !target.includes("*");
+            const available = (collection
+              ? proposal.collection_source_fields || []
+              : proposal.nested_source_fields || []
+            ).filter((item) =>
+              item.artifact_type === artifactType
+              && (collection || item.source_pointer.split("/").length === target.split("/").length)
+            );
+            if (available.some((item) => item.source_pointer === target)) continue;
+            const source = document.createElement("select");
+            source.dataset.parameter = parameter;
+            source.dataset.target = target;
+            source.dataset.artifactType = artifactType;
+            source.dataset.required = (selected.required_reads?.[parameter] || []).includes(target) ? "true" : "false";
+            source.append(new Option(source.dataset.required === "true"
+              ? "必需字段：请选择来源"
+              : "可选字段：不映射", ""));
+            for (const item of available) source.append(new Option(item.source_pointer, item.source_pointer));
+            const suggestion = (selected.field_suggestions || []).find((item) =>
+              item.parameter_name === parameter && item.target_pointer === target
+            );
+            if (suggestion) source.value = suggestion.source_pointer;
+            appendMappingRow(nested.body, `${parameter}${target}`, source, {
+              required: source.dataset.required === "true",
+              suggested: suggestion?.source_pointer || "",
+              note: !suggestion ? "无可靠建议；如上游没有此数据，请调整上游抽取或脚本。" : "",
+            });
+          }
+        }
+      }
+    };
+    functionSelect.addEventListener("change", refresh);
+    refresh();
+    previewMaterials.append(note, functionSelect, argumentBox, fieldBox);
+    pendingDraft.kind = "skill-function-adapter";
+    publishDraftButton.textContent = "确认参数并试运行";
+    return true;
+  };
+
+  /** 实体单参数函数优先走保留身份与证据的逐项模板，其余走通用函数入口。 */
+  const prepareScriptAdapter = async () => {
+    const proposal = await extensionApi(
+      `/api/v1/extensions/skills/${encodeURIComponent(pendingDraft.id)}/function-adapter-proposal`,
+      { method: "POST" },
+    );
+    if (proposal.standard_entrypoint) return false;
+    if (pendingDraft.profileId === "entity_transform"
+        && !proposal.functions.some((item) => item.function_name === "run")
+        && proposal.functions.some((item) => item.parameters.length === 1)) {
+      return prepareEntityAdapter();
+    }
+    return prepareFunctionAdapter();
+  };
+
+  /** 建议仅用于预填选择，结果不直接保存或执行。 */
+  const prepareScriptMapping = async () => {
+    const proposal = await extensionApi(
+      `/api/v1/extensions/skills/${encodeURIComponent(pendingDraft.id)}/input-mapping-proposals`,
+      { method: "POST" },
+    );
+    if (!proposal.detected_fields.length) return false;
+    showScriptMapping(proposal);
+    return true;
+  };
+
+  /** 试运行发现普通 JSON 时展示实际字段及当前下游契约，用户确认后再映射。 */
+  const prepareOutputMapping = async (check) => {
+    const diagnostics = (check.diagnostics || []).join("；");
+    if (!check.observed_output_fields?.length
+        || !/标准 outputs|返回字段|只返回了部分/.test(diagnostics)) return false;
+    const proposal = await extensionApi(
+      `/api/v1/extensions/skills/${encodeURIComponent(pendingDraft.id)}/output-mapping-proposals`,
+      { method: "POST" },
+    );
+    if (!proposal.target_fields?.length) return false;
+    previewMaterials.replaceChildren();
+    const intro = document.createElement("p");
+    intro.className = "field-note";
+    intro.textContent = "脚本已运行，但返回值尚未形成下游可读取的完整产物。请确认字段对应关系；未选择的返回字段不会进入此产物，缺失内容不能自动补造。";
+    const observed = document.createElement("p");
+    observed.textContent = `脚本返回：${proposal.observed_fields.map((field) => `${field}（${check.observed_output_shapes?.[field] || "结构未知"}）`).join("；")}`;
+    const issue = document.createElement("p");
+    issue.textContent = `试运行提示：${diagnostics.replaceAll("未发现第三方依赖。；", "")}`;
+    previewMaterials.append(intro, observed, issue);
+    if (Object.values(check.observed_output_shapes || {}).some((shape) => shape === "列表（0 项）")) {
+      const warning = document.createElement("p");
+      warning.textContent = "脚本返回空列表，可能没有取得正确上游数据。输出映射不会补造丢失内容；可在 Skill 管理中重新确认输入来源。";
+      previewMaterials.append(warning);
+    }
+    const mapping = createMappingTable("输出字段映射", "下游需要", "脚本返回");
+    previewMaterials.append(mapping.section);
+    for (const target of proposal.target_fields) {
+      const select = document.createElement("select");
+      select.dataset.outputTarget = target.target_field;
+      select.dataset.artifactType = target.artifact_type;
+      const empty = document.createElement("option");
+      empty.value = "";
+      empty.textContent = "暂不映射此字段";
+      select.append(empty);
+      const suggested = proposal.suggested_bindings.find((item) => item.target_field === target.target_field);
+      for (const field of proposal.observed_fields) {
+        const option = document.createElement("option");
+        option.value = `/${field.replaceAll("~", "~0").replaceAll("/", "~1")}`;
+        option.textContent = `脚本返回的 ${field}`;
+        option.selected = suggested?.source_pointer === option.value;
+        select.append(option);
+      }
+      appendMappingRow(mapping.body, target.business_label, select, {
+        required: false,
+        suggested: suggested?.source_pointer || "",
+        note: !suggested ? "无可靠建议；请按脚本实际返回选择，空置的字段不会交给下游。" : "",
+      });
+      const detail = document.createElement("div");
+      detail.dataset.outputRecordGroup = target.target_field;
+      const refreshRecordFields = () => {
+        detail.replaceChildren();
+        const recordFields = proposal.target_record_fields?.[target.target_field] || [];
+        const sourceName = select.value.slice(1);
+        const sourceFields = proposal.observed_record_fields?.[sourceName] || [];
+        if (!sourceFields.length) return;
+        const nested = createMappingTable(`${target.business_label}内部字段`, "下游字段", "脚本记录字段");
+        detail.append(nested.section);
+        for (const recordField of recordFields) {
+          const recordSelect = document.createElement("select");
+          recordSelect.dataset.outputRecordTarget = recordField;
+          recordSelect.append(new Option("暂不映射", ""));
+          for (const sourceField of sourceFields) {
+            const option = new Option(`脚本记录的 ${sourceField}`, sourceField);
+            option.selected = suggested?.source_pointer === select.value
+              && suggested?.record_field_bindings?.[recordField] === sourceField;
+            recordSelect.append(option);
+          }
+          row.append(recordSelect);
+          detail.append(row);
+        }
+      };
+      select.addEventListener("change", refreshRecordFields);
+      refreshRecordFields();
+      previewMaterials.append(detail);
+    }
+    pendingDraft.kind = "skill-output-mapping";
+    publishDraftButton.textContent = "确认输出对应关系并重试";
+    return true;
+  };
+  trigger.addEventListener("click", () => open(choiceDialog));
+  choiceDialog.addEventListener("click", async (event) => {
+    const selected = event.target.closest("[data-extension-choice]");
+    if (!selected) return;
+    choiceDialog.close();
+    if (selected.dataset.extensionChoice === "manage") {
+      open(managementChoiceDialog);
+      return;
+    }
+    const isSkill = selected.dataset.extensionChoice === "skill";
+    if (!isSkill) {
+      try { await loadSkillOptions(); }
+      catch (error) { return extensionNotice(`读取 Skill 目录失败：${error.message}`, true); }
+    }
+    open(isSkill ? skillDialog : agentDialog);
+  });
+  // 使用同源相对地址，确保正式端和测试端进入各自隔离的定义管理页。
+  managementChoiceDialog.addEventListener("click", (event) => {
+    const selected = event.target.closest("[data-extension-manage]");
+    if (!selected) return;
+    const tab = selected.dataset.extensionManage;
+    window.location.assign(`/extensions?tab=${encodeURIComponent(tab)}`);
+  });
+  document.querySelectorAll("[data-extension-close]").forEach((button) => button.addEventListener("click", () => button.closest("dialog").close()));
+
+  skillForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const submit = skillForm.querySelector("button[type=submit]");
+    const form = new FormData(skillForm);
+    submit.disabled = true;
+    submit.textContent = "正在生成草稿…";
+    try {
+      const payload = { name: form.get("name"), solves_problem: form.get("solves_problem"), applicable_materials: form.get("applicable_materials"), expected_result: form.get("expected_result"), example_request: form.get("example_request"), additional_requirements: form.get("additional_requirements") || "" };
+      const proposal = await extensionApi("/api/v1/extensions/business-skills/proposals", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+      const resources = form.getAll("resource").filter((item) => item instanceof File && item.size);
+      skillDialog.close();
+      showDraftPreview({
+        kind: "skill-proposal",
+        name: String(form.get("name")),
+        payload,
+        resources,
+        resourcePath: String(form.get("resource_path") || ""),
+        contractProposal: proposal,
+        items: [
+          ["能力名称", String(form.get("name"))],
+          ["解决的问题", String(form.get("solves_problem"))],
+          ["系统建议", `${proposal.selected.business_name}：${proposal.selected.suggested_position}`],
+          ["接收内容", proposal.selected.input_description],
+          ["交付内容", proposal.selected.output_description],
+          ["识别依据", proposal.reason],
+        ],
+      });
+    } catch (error) {
+      extensionNotice(`生成 Skill 草稿失败：${error.message}`, true);
+    } finally {
+      submit.disabled = false; submit.textContent = "生成草稿";
+    }
+  });
+
+  agentForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const submit = agentForm.querySelector("button[type=submit]");
+    const form = new FormData(agentForm);
+    submit.disabled = true;
+    submit.textContent = "正在生成草稿…";
+    try {
+      const allowedSkills = form.getAll("allowed_skill_names").map(String);
+      if (!allowedSkills.length) throw new Error("请至少选择一个允许调用的 Skill");
+      const selectedSkillLabels = [...skillOptions.querySelectorAll("input:checked")].map((item) => item.parentElement.textContent.trim()).join("；");
+      const agent = await extensionApi("/api/v1/extensions/business-agents/drafts", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: form.get("name"), responsibility: form.get("responsibility"), applicable_scenarios: form.get("applicable_scenarios"), example_request: form.get("example_request"), allowed_skill_names: allowedSkills }) });
+      agentForm.reset();
+      agentDialog.close();
+      showDraftPreview({
+        kind: "agents",
+        id: agent.agent_id,
+        name: agent.name,
+        items: [
+          ["Agent 名称", agent.name],
+          ["负责工作", String(form.get("responsibility"))],
+          ["适用场景", String(form.get("applicable_scenarios"))],
+          ["典型用户提问", String(form.get("example_request"))],
+          ["允许调用的 Skill", selectedSkillLabels],
+          ["系统处理方式", "系统会根据所选 Skill 自动推导该 Agent 可以处理的任务与资料范围。"],
+        ],
+      });
+    } catch (error) {
+      extensionNotice(`生成 Agent 草稿失败：${error.message}`, true);
+    } finally {
+      submit.disabled = false; submit.textContent = "生成草稿";
+    }
+  });
+
+  /** 只有用户在预览中确认后才切换发布指针，草稿不会进入新任务的动态发现范围。 */
+  publishDraftButton.addEventListener("click", async () => {
+    if (!pendingDraft) return;
+    publishDraftButton.disabled = true;
+    publishDraftButton.textContent = "正在发布…";
+    try {
+      if (pendingDraft.kind === "skill-proposal") {
+        const selector = document.querySelector("#extension-contract-profile-select");
+        const payload = {
+          ...pendingDraft.payload,
+          contract_profile_id: selector?.value || pendingDraft.contractProposal.selected.profile_id,
+        };
+        const skill = await extensionApi("/api/v1/extensions/business-skills/drafts", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        for (const resource of pendingDraft.resources) {
+          const resourceForm = new FormData();
+          const explicitPath = pendingDraft.resources.length === 1 ? pendingDraft.resourcePath : "";
+          resourceForm.append("relative_path", explicitPath || resource.name);
+          resourceForm.append("resource", resource);
+          await extensionApi(`/api/v1/extensions/skills/${encodeURIComponent(skill.skill_id)}/resources`, { method: "POST", body: resourceForm });
+        }
+        const hasScriptResource = pendingDraft.resources.some((resource) => resource.name.toLowerCase().endsWith(".py"))
+          || (pendingDraft.resources.length === 1
+            && pendingDraft.resourcePath.toLowerCase().endsWith(".py"));
+        // 草稿一旦落库，后续重试只针对同一 Skill，不重复创建稳定身份。
+        pendingDraft = { kind: hasScriptResource ? "skills-awaiting-mapping" : "skills", id: skill.skill_id, name: skill.name, profileId: payload.contract_profile_id };
+        if (hasScriptResource) {
+          publishDraftButton.textContent = "正在分析脚本输入…";
+          if (await prepareScriptAdapter()) return;
+          if (await prepareScriptMapping()) return;
+          pendingDraft.kind = "skills";
+          publishDraftButton.textContent = "正在检查脚本依赖与契约…";
+          const check = await extensionApi(`/api/v1/extensions/skills/${encodeURIComponent(skill.skill_id)}/contract-checks`, { method: "POST" });
+          if (check.status !== "PASSED") {
+            if (await prepareOutputMapping(check)) return;
+            throw new Error(`脚本契约检查未通过：${check.diagnostics.filter((item) => item !== "未发现第三方依赖。").join("；")}`);
+          }
+        }
+        publishDraftButton.textContent = "正在发布…";
+        await extensionApi(`/api/v1/extensions/skills/${encodeURIComponent(skill.skill_id)}/publish`, { method: "POST" });
+        skillForm.reset();
+        previewDialog.close();
+        extensionNotice("自定义 Skill 已按确认的使用方式发布；下一轮新任务会自动发现它。");
+        window.dispatchEvent(new CustomEvent("kg-agent-extension-published"));
+        pendingDraft = null;
+        return;
+      }
+      if (pendingDraft.kind === "skills-awaiting-mapping") {
+        publishDraftButton.textContent = "正在分析脚本输入…";
+        if (await prepareScriptAdapter()) return;
+        if (await prepareScriptMapping()) return;
+        pendingDraft.kind = "skills";
+      }
+      if (pendingDraft.kind === "skill-entity-adapter") {
+        const [functionName, parameterName] = JSON.parse(
+          document.querySelector("#extension-entity-function").value
+        );
+        const resultField = document.querySelector("#extension-entity-custom-result").value.trim()
+          || document.querySelector("#extension-entity-result").value;
+        if (!resultField) throw new Error("请确认脚本返回的标准名称字段");
+        await extensionApi(
+          `/api/v1/extensions/skills/${encodeURIComponent(pendingDraft.id)}/entity-adapter`,
+          {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              function_name: functionName,
+              parameter_name: parameterName,
+              result_field: resultField,
+            }),
+          },
+        );
+        pendingDraft.kind = "skills";
+      }
+      if (pendingDraft.kind === "skill-function-adapter") {
+        const argumentsList = [...document.querySelectorAll("#extension-function-arguments select")].map((select) => {
+          if (!select.value) throw new Error(`请确认参数 ${select.dataset.parameter} 需要什么内容`);
+          if (select.value === "TASK_PAYLOAD" || select.value === "INPUTS") {
+            return { parameter_name: select.dataset.parameter, source: select.value };
+          }
+          const [artifactType, pointer] = JSON.parse(select.value);
+          if (artifactType === "CONTENT") {
+            return {
+              parameter_name: select.dataset.parameter,
+              source: "ARTIFACT_CONTENT",
+              artifact_type: pointer,
+            };
+          }
+          return {
+            parameter_name: select.dataset.parameter,
+            source: "ARTIFACT_FIELD",
+            artifact_type: artifactType,
+            source_pointer: pointer,
+          };
+        });
+        const missingFields = [...document.querySelectorAll("#extension-function-fields select")]
+          .filter((select) => select.dataset.required === "true" && !select.value)
+          .map((select) => `${select.dataset.parameter}${select.dataset.target}`);
+        if (missingFields.length) {
+          throw new Error(`脚本需要的上游字段不存在或尚未确认：${missingFields.join("、")}`);
+        }
+        const fieldBindings = [...document.querySelectorAll("#extension-function-fields select")]
+          .map((select) => ({
+            parameter_name: select.dataset.parameter,
+            artifact_type: select.dataset.artifactType,
+            source_pointer: select.value,
+            target_pointer: select.dataset.target,
+          }));
+        for (const binding of fieldBindings) {
+          if (!argumentsList.some((arg) => arg.parameter_name === binding.parameter_name
+            && arg.source === "ARTIFACT_CONTENT")) {
+            throw new Error("内部字段映射需要选择该上游产物的完整内容");
+          }
+        }
+        await extensionApi(
+          `/api/v1/extensions/skills/${encodeURIComponent(pendingDraft.id)}/function-adapter`,
+          {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              function_name: document.querySelector("#extension-function-name").value,
+              arguments: argumentsList,
+              field_bindings: fieldBindings,
+            }),
+          },
+        );
+        pendingDraft.kind = "skills";
+      }
+      if (pendingDraft.kind === "skill-mapping") {
+        const bindings = [...previewMaterials.querySelectorAll("select[data-script-field]")].map((select) => {
+          if (!select.value) throw new Error(`请为脚本字段 ${select.dataset.scriptField} 确认来源`);
+          const [artifactType, sourcePointer] = JSON.parse(select.value);
+          return {
+            script_field: select.dataset.scriptField,
+            artifact_type: artifactType,
+            source_pointer: sourcePointer,
+            required: true,
+          };
+        });
+        await extensionApi(
+          `/api/v1/extensions/skills/${encodeURIComponent(pendingDraft.id)}/input-bindings`,
+          {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(bindings),
+          },
+        );
+        pendingDraft.kind = "skills";
+      }
+      if (pendingDraft.kind === "skill-output-mapping") {
+        const bindings = [...previewMaterials.querySelectorAll("select[data-output-target]")]
+          .filter((select) => select.value)
+          .map((select) => ({
+            artifact_type: select.dataset.artifactType,
+            source_pointer: select.value,
+            target_field: select.dataset.outputTarget,
+            record_field_bindings: Object.fromEntries(
+              [...(previewMaterials.querySelector(
+                `[data-output-record-group="${select.dataset.outputTarget}"]`
+              )?.querySelectorAll("select[data-output-record-target]") || [])]
+                .filter((recordSelect) => recordSelect.value)
+                .map((recordSelect) => [
+                  recordSelect.dataset.outputRecordTarget,
+                  recordSelect.value,
+                ]),
+            ),
+          }));
+        if (!bindings.length) throw new Error("请至少确认一个脚本返回字段的用途");
+        await extensionApi(
+          `/api/v1/extensions/skills/${encodeURIComponent(pendingDraft.id)}/output-bindings`,
+          {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(bindings),
+          },
+        );
+        pendingDraft.kind = "skills";
+      }
+      if (pendingDraft.kind === "skills") {
+        const detail = await extensionApi(`/api/v1/extensions/skills/${encodeURIComponent(pendingDraft.id)}`);
+        if ((detail.resources || []).some((item) => String(item.relative_path || "").toLowerCase().endsWith(".py"))) {
+          publishDraftButton.textContent = "正在检查脚本依赖与契约…";
+          const check = await extensionApi(`/api/v1/extensions/skills/${encodeURIComponent(pendingDraft.id)}/contract-checks`, { method: "POST" });
+          if (check.status !== "PASSED") {
+            if (await prepareOutputMapping(check)) return;
+            throw new Error(`脚本契约检查未通过：${check.diagnostics.filter((item) => item !== "未发现第三方依赖。").join("；")}`);
+          }
+        }
+      }
+      publishDraftButton.textContent = "正在发布…";
+      await extensionApi(`/api/v1/extensions/${pendingDraft.kind}/${encodeURIComponent(pendingDraft.id)}/publish`, { method: "POST" });
+      previewDialog.close();
+      extensionNotice(`${pendingDraft.kind === "skills" ? "自定义 Skill" : "自定义 Agent"} 已发布；下一轮新任务会自动发现它。`);
+      // 通知仍停留在工作台的页面立即更新名称目录，无需刷新或重新提交任务。
+      window.dispatchEvent(new CustomEvent("kg-agent-extension-published"));
+      pendingDraft = null;
+    } catch (error) {
+      extensionNotice(`发布草稿失败：${error.message}`, true);
+    } finally {
+      publishDraftButton.disabled = false;
+      publishDraftButton.textContent = pendingDraft?.kind === "skill-mapping"
+        ? "确认字段来源并发布"
+        : pendingDraft?.kind === "skill-entity-adapter" ? "确认适配并试运行"
+        : pendingDraft?.kind === "skill-output-mapping" ? "确认输出对应关系并重试"
+        : pendingDraft?.kind === "skill-function-adapter" ? "确认参数并试运行" : "确认发布";
+    }
+  });
+}
+
+initializeExtensionDialogs();

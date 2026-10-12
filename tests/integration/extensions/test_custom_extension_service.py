@@ -1,0 +1,934 @@
+"""验证自定义 Agent、Skill 定义包的草稿、发布和运行期发现投影。"""
+
+from pathlib import Path
+
+import pytest
+
+from kg_agent.exceptions import CustomExtensionValidationError
+from kg_agent.extensions.contracts import (
+    BusinessAgentDraftInput,
+    BusinessSkillDraftInput,
+    CustomAgentDefinitionInput,
+    CustomSkillDefinitionInput,
+)
+from kg_agent.extensions.script_contract_validation import ScriptContractValidator
+from kg_agent.extensions.script_field_mapping import (
+    ScriptInputFieldBinding,
+    ScriptMappingSelection,
+)
+from kg_agent.extensions.service import CustomExtensionService
+from kg_agent.infrastructure.database.session import Database
+from kg_agent.model_gateway.fake import FakeModelAdapter
+from kg_agent.registries.agent_registry import AgentRegistry
+from kg_agent.registries.artifact_registry import ArtifactRegistry
+from kg_agent.registries.skill_registry import SkillRegistry
+
+
+class _SuccessfulScriptRunner:
+    """返回指定 Artifact 的确定性 Runner 替身，不在测试进程执行用户脚本。"""
+
+    def __init__(self, artifact_type: str, content: dict[str, object]) -> None:
+        self._artifact_type = artifact_type
+        self._content = content
+
+    async def execute(self, **_: object) -> dict[str, object]:
+        """模拟已经由隔离容器返回且格式合法的脚本响应。"""
+
+        return {
+            "result": {
+                "outputs": [
+                    {
+                        "artifact_type": self._artifact_type,
+                        "content": self._content,
+                        "content_summary": "契约试运行结果",
+                    }
+                ],
+                "quality_signals": {},
+            }
+        }
+
+
+def _skill_input() -> CustomSkillDefinitionInput:
+    """构造只产生现有 Artifact 的合法自定义 LLM Skill 草稿。"""
+
+    return CustomSkillDefinitionInput(
+        skill_key="summarize_equipment",
+        name="设备摘要 Skill",
+        description="从语义文档生成结构化设备实体。",
+        supported_subtask_types=["equipment_summarize"],
+        input_artifact_types=["SemanticDocument"],
+        output_artifact_types=["EntityDataset"],
+        instruction_markdown="只提取文档明确出现的设备实体。",
+    )
+
+
+def _agent_input(*, allowed_skills: list[str]) -> CustomAgentDefinitionInput:
+    """构造通过 YAML 授权自定义 Skill 的专业 Agent 草稿。"""
+
+    return CustomAgentDefinitionInput(
+        agent_key="equipment_analysis_agent",
+        name="设备分析 Agent",
+        description="负责设备类文档的结构化摘要。",
+        accepted_subtask_types=["equipment_summarize"],
+        accepted_input_types=["SemanticDocument"],
+        produced_output_types=["EntityDataset"],
+        instruction_markdown="仅处理设备摘要任务，并按权限选择 Skill。",
+        allowed_skill_names=allowed_skills,
+    )
+
+
+@pytest.mark.asyncio
+async def test_custom_definition_lifecycle_and_runtime_discovery() -> None:
+    """草稿、资源、发布与权限 YAML 应形成唯一的动态发现来源。"""
+
+    database = Database("sqlite+aiosqlite:///:memory:")
+    await database.create_schema()
+    root = Path(__file__).resolve().parents[3]
+    artifacts = ArtifactRegistry.v1()
+    builtins = SkillRegistry.from_directory(
+        root / "src" / "kg_agent" / "skills" / "catalog", artifact_registry=artifacts
+    )
+    agents = AgentRegistry.from_directory(root / "configs" / "agents")
+    service = CustomExtensionService(
+        database.session_factory,
+        artifact_registry=artifacts,
+        builtin_agent_keys=[item.agent_type for item in agents.list_all()],
+        builtin_skill_keys=[item.name for item in builtins.list_all()],
+    )
+
+    skill = await service.create_skill(_skill_input())
+    assert skill.status == "DRAFT"
+    assert skill.current_revision_id is None
+    resource = await service.add_skill_resource(
+        skill.skill_id,
+        relative_path="references/equipment.md",
+        media_type="text/markdown",
+        content="设备参考资料".encode(),
+    )
+    assert resource.relative_path == "references/equipment.md"
+    published_skill = await service.publish_skill(skill.skill_id)
+    assert published_skill.status == "ACTIVE"
+    assert published_skill.current_revision is not None
+    assert published_skill.current_revision.revision_number == 1
+
+    agent = await service.create_agent(_agent_input(allowed_skills=["summarize_equipment"]))
+    published_agent = await service.publish_agent(agent.agent_id)
+    assert published_agent.status == "ACTIVE"
+    assert "allowed_skills:" in (published_agent.permissions_yaml or "")
+
+    active_agents, active_skills = await service.load_active_registrations()
+    assert [item.agent_type for item in active_agents] == ["equipment_analysis_agent"]
+    assert active_agents[0].allowed_skills == ["summarize_equipment"]
+    assert len(active_skills) == 1
+    registration, prompt, has_script = active_skills[0]
+    assert registration.allowed_agents == ["equipment_analysis_agent"]
+    assert registration.output_artifact_types == ["EntityDataset"]
+    assert prompt == "只提取文档明确出现的设备实体。"
+    assert has_script is False
+
+    # 已发布 Skill 再编辑时，当前发布指针仍稳定指向 revision 1；新内容只作为草稿。
+    updated = _skill_input().model_copy(update={"description": "修订后的设备摘要。"})
+    draft = await service.update_skill(skill.skill_id, updated)
+    assert draft.current_revision is not None
+    assert draft.current_revision.revision_number == 1
+    assert draft.draft_revision is not None
+    assert draft.draft_revision.revision_number == 2
+    await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_custom_agent_cannot_publish_unknown_or_privileged_skill() -> None:
+    """自定义 Agent 的 YAML 只允许引用已发布能力，且不能取得发布权限。"""
+
+    database = Database("sqlite+aiosqlite:///:memory:")
+    await database.create_schema()
+    artifacts = ArtifactRegistry.v1()
+    service = CustomExtensionService(
+        database.session_factory,
+        artifact_registry=artifacts,
+        builtin_agent_keys=["knowledge_extraction_agent"],
+        builtin_skill_keys=["extract_knowledge", "publish_graph"],
+    )
+    agent = await service.create_agent(_agent_input(allowed_skills=["not_published_yet"]))
+    with pytest.raises(Exception, match="未发布或不存在的 Skill"):
+        await service.publish_agent(agent.agent_id)
+
+    with pytest.raises(Exception, match="不允许获得本体或图谱发布 Skill 权限"):
+        await service.create_agent(_agent_input(allowed_skills=["publish_graph"]))
+    await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_script_execution_is_inferred_from_uploaded_python_resource() -> None:
+    """用户不选择类型；发布服务应根据当前草稿是否上传 Python 文件确定执行器。"""
+
+    database = Database("sqlite+aiosqlite:///:memory:")
+    await database.create_schema()
+    artifacts = ArtifactRegistry.v1()
+    service = CustomExtensionService(
+        database.session_factory,
+        artifact_registry=artifacts,
+        builtin_agent_keys=["knowledge_extraction_agent"],
+        builtin_skill_keys=[],
+        script_contract_validator=ScriptContractValidator(
+            artifacts,
+            _SuccessfulScriptRunner("EntityDataset", {"entities": []}),
+        ),
+    )
+    skill = await service.create_skill(
+        _skill_input().model_copy(
+            update={
+                "script_input_bindings": [
+                    ScriptInputFieldBinding(
+                        script_field="paragraphs",
+                        artifact_type="SemanticDocument",
+                        source_pointer="/segments",
+                    )
+                ]
+            }
+        )
+    )
+    await service.add_skill_resource(
+        skill.skill_id,
+        relative_path="main.py",
+        media_type="text/x-python",
+        content=b"def run(inputs, parameters):\n    return {'outputs': []}\n",
+    )
+    with pytest.raises(Exception, match="尚未通过当前资源和契约的沙箱试运行"):
+        await service.publish_skill(skill.skill_id)
+    check = await service.check_skill_contract(skill.skill_id)
+    assert check.status == "PASSED"
+    published = await service.publish_skill(skill.skill_id)
+    assert published.metadata is not None
+    assert "implementation" not in published.metadata
+    assert "entrypoint" not in published.metadata
+    bundle = await service.load_script_bundle("summarize_equipment", 1)
+    assert bundle.entrypoint == "main.py"
+    assert bundle.input_bindings[0].script_field == "paragraphs"
+    assert bundle.resources[0][0] == "main.py"
+    await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_business_forms_compile_to_existing_contracts_without_exposing_them() -> None:
+    """非开发者业务表单应自动生成已注册契约，并从授权 Skill 推导 Agent 能力。"""
+
+    database = Database("sqlite+aiosqlite:///:memory:")
+    await database.create_schema()
+    root = Path(__file__).resolve().parents[3]
+    artifacts = ArtifactRegistry.v1()
+    builtins = SkillRegistry.from_directory(
+        root / "src" / "kg_agent" / "skills" / "catalog", artifact_registry=artifacts
+    )
+    agents = AgentRegistry.from_directory(root / "configs" / "agents")
+    service = CustomExtensionService(
+        database.session_factory,
+        artifact_registry=artifacts,
+        builtin_agent_keys=[item.agent_type for item in agents.list_all()],
+        builtin_skill_keys=[item.name for item in builtins.list_all()],
+    )
+
+    skill = await service.create_business_skill(
+        BusinessSkillDraftInput(
+            name="设备故障分析",
+            solves_problem="归纳设备故障现象、原因和处理建议。",
+            applicable_materials="设备手册、维修记录和故障报告。",
+            expected_result="输出含故障、原因、建议和证据摘要的结构化结果。",
+            example_request="请分析上传维修资料中的常见故障。",
+        )
+    )
+    assert skill.status == "DRAFT"
+    assert skill.metadata is not None
+    assert skill.metadata["display_name"] == "设备故障分析"
+    assert skill.metadata["input_artifact_types"] == ["SemanticDocument"]
+    assert skill.metadata["output_artifact_types"] == ["StructuredDataset"]
+    assert skill.skill_key.startswith("custom_skill_")
+    await service.publish_skill(skill.skill_id)
+
+    options = await service.list_active_skill_options(builtins.list_all())
+    agent = await service.create_business_agent(
+        BusinessAgentDraftInput(
+            name="设备故障分析 Agent",
+            responsibility="负责调用设备故障分析能力并交付结构化结果。",
+            applicable_scenarios="用户要求分析设备文档中的故障时。",
+            example_request="请根据上传资料分析设备故障。",
+            allowed_skill_names=[skill.skill_key],
+        ),
+        available_skills=options,
+    )
+    assert agent.status == "DRAFT"
+    assert agent.metadata is not None
+    assert agent.metadata["display_name"] == "设备故障分析 Agent"
+    assert agent.metadata["accepted_input_types"] == ["SemanticDocument"]
+    assert agent.metadata["produced_output_types"] == ["StructuredDataset"]
+    assert agent.agent_key.startswith("custom_agent_")
+    await service.publish_agent(agent.agent_id)
+    active_agents, active_skills = await service.load_active_registrations()
+    assert active_agents[0].name == "设备故障分析 Agent"
+    assert active_skills[0][0].name == skill.skill_key
+    assert active_skills[0][0].display_name == "设备故障分析"
+
+    # 用户确认非默认 Profile 后，服务端必须从受控模板生成真正不同的契约，不能再
+    # 静默退回 SemanticDocument -> StructuredDataset。
+    property_skill = await service.create_business_skill(
+        BusinessSkillDraftInput(
+            name="设备属性单位标准化",
+            solves_problem="统一已经抽取出的设备参数单位。",
+            applicable_materials="设备属性数据。",
+            expected_result="标准化后的属性继续进入知识融合。",
+            example_request="请统一设备属性单位。",
+            contract_profile_id="property_transform",
+        )
+    )
+    assert property_skill.metadata is not None
+    assert property_skill.metadata["input_artifact_types"] == ["PropertyDataset"]
+    assert property_skill.metadata["output_artifact_types"] == ["PropertyDataset"]
+    assert property_skill.metadata["integration_mode"] == "PIPELINE"
+    assert property_skill.metadata["contract_profile_id"] == "property_transform"
+    await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_business_definition_edit_keeps_active_version_and_script_resources() -> None:
+    """业务化编辑应创建新草稿、复制资源，并允许停用后修订再发布。"""
+
+    database = Database("sqlite+aiosqlite:///:memory:")
+    await database.create_schema()
+    artifacts = ArtifactRegistry.v1()
+    service = CustomExtensionService(
+        database.session_factory,
+        artifact_registry=artifacts,
+        builtin_agent_keys=["knowledge_extraction_agent"],
+        builtin_skill_keys=[],
+        script_contract_validator=ScriptContractValidator(
+            artifacts,
+            _SuccessfulScriptRunner("StructuredDataset", {"columns": ["result"], "rows": []}),
+        ),
+    )
+    original = BusinessSkillDraftInput(
+        name="设备故障分析",
+        solves_problem="归纳故障原因。",
+        applicable_materials="设备维修记录。",
+        expected_result="输出故障清单。",
+        example_request="分析设备故障。",
+    )
+    skill = await service.create_business_skill(original)
+    await service.add_skill_resource(
+        skill.skill_id,
+        relative_path="main.py",
+        media_type="text/x-python",
+        content=b"def run(inputs, parameters):\n    return {'outputs': []}\n",
+    )
+    await service.check_skill_contract(skill.skill_id)
+    await service.publish_skill(skill.skill_id)
+
+    edited = original.model_copy(
+        update={"name": "设备风险分析", "solves_problem": "归纳故障风险和处理优先级。"}
+    )
+    draft = await service.update_business_skill(skill.skill_id, edited)
+    assert draft.status == "ACTIVE"
+    assert draft.current_revision is not None and draft.current_revision.revision_number == 1
+    assert draft.draft_revision is not None and draft.draft_revision.revision_number == 2
+    assert draft.metadata is not None
+    assert draft.metadata["business_input"]["solves_problem"] == "归纳故障风险和处理优先级。"
+    assert [item["relative_path"] for item in draft.resources] == ["main.py"]
+
+    await service.check_skill_contract(skill.skill_id)
+    await service.publish_skill(skill.skill_id)
+    await service.disable_skill(skill.skill_id)
+    resumed = await service.update_business_skill(skill.skill_id, edited)
+    assert resumed.status == "DISABLED"
+    assert resumed.draft_revision is not None
+    await service.check_skill_contract(skill.skill_id)
+    republished = await service.publish_skill(skill.skill_id)
+    assert republished.status == "ACTIVE"
+    assert republished.current_revision is not None
+    assert republished.current_revision.revision_number == 3
+    await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_only_disabled_custom_definitions_can_be_deleted() -> None:
+    """删除只清理停用定义包；活动定义和其权限引用必须继续受到保护。"""
+
+    database = Database("sqlite+aiosqlite:///:memory:")
+    await database.create_schema()
+    artifacts = ArtifactRegistry.v1()
+    service = CustomExtensionService(
+        database.session_factory,
+        artifact_registry=artifacts,
+        builtin_agent_keys=["knowledge_extraction_agent"],
+        builtin_skill_keys=[],
+    )
+
+    skill = await service.create_skill(_skill_input())
+    with pytest.raises(Exception, match="只能删除已停用的 Skill"):
+        await service.delete_skill(skill.skill_id)
+    await service.disable_skill(skill.skill_id)
+    await service.delete_skill(skill.skill_id)
+    assert await service.list_skills() == []
+
+    agent = await service.create_agent(_agent_input(allowed_skills=[]))
+    with pytest.raises(Exception, match="只能删除已停用的 Agent"):
+        await service.delete_agent(agent.agent_id)
+    await service.disable_agent(agent.agent_id)
+    await service.delete_agent(agent.agent_id)
+    assert await service.list_agents() == []
+    await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_script_mapping_proposal_requires_confirmation_and_new_revision() -> None:
+    """模型只建议已注册字段，用户确认后新修订仍保留脚本并须重新试运行。"""
+
+    database = Database("sqlite+aiosqlite:///:memory:")
+    await database.create_schema()
+    artifacts = ArtifactRegistry.v1()
+    binding = ScriptInputFieldBinding(
+        script_field="paragraphs",
+        artifact_type="SemanticDocument",
+        source_pointer="/segments",
+    )
+    model = FakeModelAdapter(
+        [ScriptMappingSelection(suggested_bindings=[binding], reason="文档段落对应脚本输入")]
+    )
+    service = CustomExtensionService(
+        database.session_factory,
+        artifact_registry=artifacts,
+        builtin_agent_keys=["knowledge_extraction_agent"],
+        builtin_skill_keys=[],
+        model_gateway=model,
+        script_contract_validator=ScriptContractValidator(
+            artifacts,
+            _SuccessfulScriptRunner("EntityDataset", {"entities": []}),
+        ),
+    )
+    skill = await service.create_skill(_skill_input())
+    await service.add_skill_resource(
+        skill.skill_id,
+        relative_path="main.py",
+        media_type="text/x-python",
+        content=(
+            b"def run(inputs, parameters):\n"
+            b"    return parameters.get('input_fields', {})['paragraphs']\n"
+        ),
+    )
+
+    proposal = await service.propose_script_input_mapping(skill.skill_id)
+    assert proposal.detected_fields == ["paragraphs"]
+    assert proposal.suggested_bindings == [binding]
+    confirmed = await service.confirm_script_input_mapping(skill.skill_id, [binding])
+    assert confirmed.draft_revision is not None
+    assert confirmed.draft_revision.revision_number == 2
+    check = await service.check_skill_contract(skill.skill_id)
+    assert check.status == "PASSED"
+    published = await service.publish_skill(skill.skill_id)
+    assert published.current_revision is not None
+    assert published.current_revision.revision_number == 2
+    bundle = await service.load_script_bundle(skill.skill_key, 2)
+    assert bundle.input_bindings == (binding,)
+    await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_exact_script_field_skips_model_mapping_call() -> None:
+    """脚本字段唯一等于注册字段时，代码可直接预填而无需模型推断。"""
+
+    database = Database("sqlite+aiosqlite:///:memory:")
+    await database.create_schema()
+    artifacts = ArtifactRegistry.v1()
+    model = FakeModelAdapter([])
+    service = CustomExtensionService(
+        database.session_factory,
+        artifact_registry=artifacts,
+        builtin_agent_keys=["knowledge_extraction_agent"],
+        builtin_skill_keys=[],
+        model_gateway=model,
+    )
+    skill = await service.create_skill(_skill_input())
+    await service.add_skill_resource(
+        skill.skill_id,
+        relative_path="main.py",
+        media_type="text/x-python",
+        content=(
+            b"def run(inputs, parameters):\n    return parameters['input_fields']['segments']\n"
+        ),
+    )
+
+    proposal = await service.propose_script_input_mapping(skill.skill_id)
+
+    assert proposal.detected_fields == ["segments"]
+    assert proposal.suggested_bindings[0].source_pointer == "/segments"
+    assert model.calls == []
+    await database.dispose()
+
+
+class _RawReportRunner:
+    """返回无需开发者包装 outputs 的普通 JSON 报告。"""
+
+    async def execute(self, **_: object) -> dict[str, object]:
+        """模拟隔离 Runner 返回非标准字段名称。"""
+
+        return {"result": {"headline": "维修报告", "finding": "液压泵漏油", "severity": "高"}}
+
+
+@pytest.mark.asyncio
+async def test_raw_script_output_is_confirmed_then_published_as_existing_contract() -> None:
+    """试运行发现原始字段、用户确认映射、新修订复验与发布必须形成闭环。"""
+
+    from kg_agent.extensions.script_field_mapping import ScriptOutputFieldBinding
+
+    database = Database("sqlite+aiosqlite:///:memory:")
+    await database.create_schema()
+    artifacts = ArtifactRegistry.v1()
+    service = CustomExtensionService(
+        database.session_factory,
+        artifact_registry=artifacts,
+        builtin_agent_keys=[],
+        builtin_skill_keys=[],
+        script_contract_validator=ScriptContractValidator(artifacts, _RawReportRunner()),
+    )
+    skill = await service.create_skill(
+        CustomSkillDefinitionInput(
+            skill_key="equipment_fault_report",
+            name="设备故障报告",
+            description="把设备资料整理成报告。",
+            supported_subtask_types=["fault_report"],
+            input_artifact_types=["SemanticDocument"],
+            output_artifact_types=["TextReport"],
+            contract_profile_id="document_text_report",
+            integration_mode="SIDE_OUTPUT",
+            result_semantics="REPORT",
+            instruction_markdown="根据文档生成设备故障报告。",
+        )
+    )
+    await service.add_skill_resource(
+        skill.skill_id,
+        relative_path="main.py",
+        media_type="text/x-python",
+        content=b"def run(inputs, parameters): return {'headline': 'report'}\n",
+    )
+    # 列表只提供资源摘要，前端据此展示“配置脚本输出”，不会泄露脚本正文。
+    listed = await service.list_skills()
+    assert [item["relative_path"] for item in listed[0].resources] == ["main.py"]
+    assert "content" not in listed[0].resources[0]
+    first = await service.check_skill_contract(skill.skill_id)
+    assert first.status == "FAILED"
+    assert first.observed_output_fields == ["finding", "headline", "severity"]
+
+    proposal = await service.propose_script_output_mapping(skill.skill_id)
+    assert proposal.observed_fields == first.observed_output_fields
+    assert any(item.target_field == "title" for item in proposal.target_fields)
+    bindings = [
+        ScriptOutputFieldBinding(
+            artifact_type="TextReport", source_pointer="/headline", target_field="title"
+        ),
+        ScriptOutputFieldBinding(
+            artifact_type="TextReport", source_pointer="/finding", target_field="summary"
+        ),
+    ]
+    revised = await service.confirm_script_output_mapping(skill.skill_id, bindings)
+    assert revised.draft_revision is not None
+    assert revised.draft_revision.revision_number == 2
+    second = await service.check_skill_contract(skill.skill_id)
+    assert second.status == "PASSED"
+    published = await service.publish_skill(skill.skill_id)
+    assert published.status == "ACTIVE"
+    bundle = await service.load_script_bundle("equipment_fault_report", 2)
+    assert [item.target_field for item in bundle.output_bindings] == ["title", "summary"]
+    await database.dispose()
+
+
+class _EntityAdapterCaptureRunner:
+    """只检查隔离作业请求是否包含两条样例和已确认适配配置。"""
+
+    async def execute(self, **kwargs: object) -> dict[str, object]:
+        """返回符合契约的测试产物，不在宿主机执行用户脚本。"""
+
+        payload = kwargs["input_payload"]
+        assert isinstance(payload, dict)
+        inputs = payload["inputs"]
+        assert isinstance(inputs, list)
+        assert len(inputs[0]["content"]["entities"]) == 2
+        assert "entity_record_adapter" not in payload["parameters"]
+        assert kwargs["entrypoint"] == "_kg_skill_entry.py"
+        resources = dict(kwargs["resources"])
+        assert "main.py" in resources
+        assert "_kg_skill_entry.py" in resources
+        return {
+            "result": {
+                "outputs": [
+                    {
+                        "artifact_type": "EntityDataset",
+                        "content": inputs[0]["content"],
+                        "content_summary": "逐项适配检查通过",
+                    }
+                ]
+            }
+        }
+
+
+@pytest.mark.asyncio
+async def test_entity_record_adapter_is_confirmed_checked_and_published() -> None:
+    """实体逐项映射须经用户确认、新修订试运行，然后才允许发布。"""
+
+    from kg_agent.extensions.script_field_mapping import EntityRecordAdapter
+
+    database = Database("sqlite+aiosqlite:///:memory:")
+    await database.create_schema()
+    artifacts = ArtifactRegistry.v1()
+    service = CustomExtensionService(
+        database.session_factory,
+        artifact_registry=artifacts,
+        builtin_agent_keys=[],
+        builtin_skill_keys=[],
+        script_contract_validator=ScriptContractValidator(artifacts, _EntityAdapterCaptureRunner()),
+    )
+    skill = await service.create_skill(
+        CustomSkillDefinitionInput(
+            skill_key="normalize_devices",
+            name="设备名称标准化",
+            description="逐个标准化实体名称",
+            supported_subtask_types=["device_normalize"],
+            input_artifact_types=["EntityDataset"],
+            output_artifact_types=["EntityDataset"],
+            contract_profile_id="entity_transform",
+            integration_mode="PIPELINE",
+            result_semantics="TRANSFORM",
+            instruction_markdown="只修改实体名称，保留证据。",
+        )
+    )
+    # 平台入口只能由确认流程生成，用户上传同名文件不得绕过契约检查。
+    with pytest.raises(CustomExtensionValidationError, match="平台保留入口"):
+        await service.add_skill_resource(
+            skill.skill_id,
+            relative_path="_kg_skill_entry.py",
+            media_type="text/x-python",
+            content=b"def run(inputs, parameters): return {'outputs': []}\n",
+        )
+    await service.add_skill_resource(
+        skill.skill_id,
+        relative_path="main.py",
+        media_type="text/x-python",
+        content=(
+            b"def normalize(device_name):\n"
+            b"    return {'standard_name': device_name.replace('assembly', '')}\n"
+        ),
+    )
+    proposal = await service.propose_entity_record_adapter(skill.skill_id)
+    assert proposal["functions"] == [
+        {
+            "function_name": "normalize",
+            "parameter_name": "device_name",
+            "result_fields": ["standard_name", "__value__"],
+        }
+    ]
+    await service.confirm_entity_record_adapter(
+        skill.skill_id,
+        EntityRecordAdapter(
+            function_name="normalize",
+            parameter_name="device_name",
+            result_field="standard_name",
+        ),
+    )
+    check = await service.check_skill_contract(skill.skill_id)
+    assert check.status == "PASSED"
+    published = await service.publish_skill(skill.skill_id)
+    assert published.status == "ACTIVE"
+    bundle = await service.load_script_bundle("normalize_devices", 2)
+    assert bundle.entrypoint == "_kg_skill_entry.py"
+    assert bundle.entity_record_adapter is None
+    resources = dict(bundle.resources)
+    assert resources["main.py"].startswith(b"def normalize(device_name):")
+    assert b"async def run(inputs, parameters)" in resources["_kg_skill_entry.py"]
+
+    # 业务描述编辑创建新修订，但不能丢失已经确认的入口及原脚本。
+    edited = await service.update_business_skill(
+        skill.skill_id,
+        BusinessSkillDraftInput(
+            name="设备名称标准化",
+            solves_problem="统一设备实体名称。",
+            applicable_materials="已抽取设备实体。",
+            expected_result="保留证据并得到规范名称。",
+            example_request="规范化设备名称。",
+            contract_profile_id="entity_transform",
+        ),
+    )
+    assert edited.metadata is not None
+    assert edited.metadata["generated_script_entrypoint"] == "_kg_skill_entry.py"
+    assert {item["relative_path"] for item in edited.resources} == {
+        "main.py",
+        "_kg_skill_entry.py",
+    }
+    assert (await service.check_skill_contract(skill.skill_id)).status == "PASSED"
+    assert (await service.publish_skill(skill.skill_id)).status == "ACTIVE"
+    assert (
+        await service.load_script_bundle("normalize_devices", 3)
+    ).entrypoint == "_kg_skill_entry.py"
+    await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_function_adapter_rejects_unmapped_existing_script_fields() -> None:
+    """已有脚本所需字段未全部对齐时，不创建看似可运行的草稿修订。"""
+
+    from kg_agent.extensions.script_field_mapping import (
+        ScriptFunctionAdapter,
+        ScriptFunctionArgument,
+        ScriptNestedFieldBinding,
+    )
+
+    database = Database("sqlite+aiosqlite:///:memory:")
+    await database.create_schema()
+    service = CustomExtensionService(
+        database.session_factory,
+        artifact_registry=ArtifactRegistry.v1(),
+        builtin_agent_keys=[],
+        builtin_skill_keys=[],
+    )
+    skill = await service.create_skill(
+        CustomSkillDefinitionInput(
+            skill_key="generic_entity_adapter_check",
+            name="已有实体脚本检查",
+            description="按已有脚本规范实体名称",
+            supported_subtask_types=["entity_transform"],
+            input_artifact_types=["EntityDataset"],
+            output_artifact_types=["EntityDataset"],
+            contract_profile_id="entity_transform",
+            integration_mode="PIPELINE",
+            result_semantics="TRANSFORM",
+            instruction_markdown="只规范实体名称。",
+        )
+    )
+    await service.add_skill_resource(
+        skill.skill_id,
+        relative_path="business.py",
+        media_type="text/x-python",
+        content=(
+            b"def run(payload):\n"
+            b"    return [{'id': row['id'], 'label': row['label']} "
+            b"for row in payload['items']]\n"
+        ),
+    )
+    proposal = await service.propose_script_function_adapter(skill.skill_id)
+    function = proposal["functions"][0]
+    assert {
+        (item["source_pointer"], item["target_pointer"])
+        for item in function["field_suggestions"]
+    } == {
+        ("/entities", "/items"),
+        ("/entities/*/entity_id", "/items/*/id"),
+        ("/entities/*/name", "/items/*/label"),
+    }
+    arguments = [
+        ScriptFunctionArgument(
+            parameter_name="payload",
+            source="ARTIFACT_CONTENT",
+            artifact_type="EntityDataset",
+        )
+    ]
+    with pytest.raises(CustomExtensionValidationError, match="payload/items/\\*/id"):
+        await service.confirm_script_function_adapter(
+            skill.skill_id,
+            ScriptFunctionAdapter(
+                function_name="run",
+                arguments=arguments,
+                field_bindings=[
+                    ScriptNestedFieldBinding(
+                        parameter_name="payload",
+                        artifact_type="EntityDataset",
+                        source_pointer="/entities",
+                        target_pointer="/items",
+                    )
+                ],
+            ),
+        )
+    confirmed = await service.confirm_script_function_adapter(
+        skill.skill_id,
+        ScriptFunctionAdapter(
+            function_name="run",
+            arguments=arguments,
+            field_bindings=[
+                ScriptNestedFieldBinding.model_validate(item)
+                for item in function["field_suggestions"]
+            ],
+        ),
+    )
+    assert confirmed.metadata is not None
+    assert len(confirmed.metadata["function_adapter"]["field_bindings"]) == 3
+    await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_nonstandard_run_parameter_is_confirmed_and_published() -> None:
+    """run(payload) 须先确认参数含义，生成入口与原文件一并发布。"""
+
+    from kg_agent.extensions.script_field_mapping import (
+        ScriptFunctionAdapter,
+        ScriptFunctionArgument,
+    )
+
+    database = Database("sqlite+aiosqlite:///:memory:")
+    await database.create_schema()
+    artifacts = ArtifactRegistry.v1()
+    service = CustomExtensionService(
+        database.session_factory,
+        artifact_registry=artifacts,
+        builtin_agent_keys=[],
+        builtin_skill_keys=[],
+        script_contract_validator=ScriptContractValidator(
+            artifacts,
+            _SuccessfulScriptRunner(
+                "TextReport",
+                {"title": "测试", "summary": "完成", "sections": [], "evidence": []},
+            ),
+        ),
+    )
+    skill = await service.create_skill(
+        CustomSkillDefinitionInput(
+            skill_key="analyze_payload",
+            name="分析资料",
+            description="生成资料报告",
+            supported_subtask_types=["analyze_payload"],
+            input_artifact_types=["SemanticDocument"],
+            output_artifact_types=["TextReport"],
+            contract_profile_id="document_text_report",
+            integration_mode="SIDE_OUTPUT",
+            result_semantics="REPORT",
+            instruction_markdown="根据资料生成报告。",
+        )
+    )
+    await service.add_skill_resource(
+        skill.skill_id,
+        relative_path="main.py",
+        media_type="text/x-python",
+        content=b"def run(payload):\n    return {'outputs': []}\n",
+    )
+    assert (await service.check_skill_contract(skill.skill_id)).status == "FAILED"
+    proposal = await service.propose_script_function_adapter(skill.skill_id)
+    assert proposal["standard_entrypoint"] is False
+    assert proposal["functions"][0]["parameters"] == ["payload"]
+    assert proposal["suggested_bindings"] == [
+        {
+            "function_name": "run",
+            "arguments": [{"parameter_name": "payload", "source": "TASK_PAYLOAD"}],
+        }
+    ]
+    detail = await service.confirm_script_function_adapter(
+        skill.skill_id,
+        ScriptFunctionAdapter(
+            function_name="run",
+            arguments=[ScriptFunctionArgument(parameter_name="payload", source="TASK_PAYLOAD")],
+        ),
+    )
+    assert detail.metadata is not None
+    assert detail.metadata["generated_script_entrypoint"] == "_kg_skill_entry.py"
+    assert (await service.check_skill_contract(skill.skill_id)).status == "PASSED"
+    assert (await service.publish_skill(skill.skill_id)).status == "ACTIVE"
+    bundle = await service.load_script_bundle("analyze_payload", 2)
+    assert bundle.entrypoint == "_kg_skill_entry.py"
+    assert dict(bundle.resources)["main.py"] == b"def run(payload):\n    return {'outputs': []}\n"
+    entity_skill = await service.create_skill(
+        CustomSkillDefinitionInput(
+            skill_key="transform_existing_entities",
+            name="实体变换",
+            description="接收已有实体内容并处理",
+            supported_subtask_types=["entity_transform"],
+            input_artifact_types=["EntityDataset"],
+            output_artifact_types=["EntityDataset"],
+            contract_profile_id="entity_transform",
+            integration_mode="PIPELINE",
+            result_semantics="TRANSFORM",
+            instruction_markdown="转换实体。",
+        )
+    )
+    await service.add_skill_resource(
+        entity_skill.skill_id,
+        relative_path="main.py",
+        media_type="text/x-python",
+        content=b"def run(payload):\n    return {'entities': payload.get('entities', [])}\n",
+    )
+    entity_proposal = await service.propose_script_function_adapter(entity_skill.skill_id)
+    assert entity_proposal["suggested_bindings"] == [
+        {
+            "function_name": "run",
+            "arguments": [
+                {
+                    "parameter_name": "payload",
+                    "source": "ARTIFACT_CONTENT",
+                    "artifact_type": "EntityDataset",
+                }
+            ],
+        }
+    ]
+    await database.dispose()
+
+
+@pytest.mark.asyncio
+async def test_output_mapping_uses_observed_script_shape_and_filters_model_suggestions() -> None:
+    """任意脚本返回字段可获受控语义建议，模型虚构字段会被代码丢弃。"""
+
+    from kg_agent.extensions.script_field_mapping import (
+        ScriptOutputFieldBinding,
+        ScriptOutputMappingSelection,
+    )
+
+    database = Database("sqlite+aiosqlite:///:memory:")
+    await database.create_schema()
+    artifacts = ArtifactRegistry.v1()
+    model = FakeModelAdapter(
+        [
+            ScriptOutputMappingSelection(
+                suggested_bindings=[
+                    ScriptOutputFieldBinding(
+                        artifact_type="TextReport",
+                        source_pointer="/headline",
+                        target_field="title",
+                    ),
+                    ScriptOutputFieldBinding(
+                        artifact_type="TextReport",
+                        source_pointer="/invented",
+                        target_field="summary",
+                    ),
+                ]
+            )
+        ]
+    )
+    service = CustomExtensionService(
+        database.session_factory,
+        artifact_registry=artifacts,
+        builtin_agent_keys=[],
+        builtin_skill_keys=[],
+        model_gateway=model,
+        script_contract_validator=ScriptContractValidator(artifacts, _RawReportRunner()),
+    )
+    skill = await service.create_skill(
+        CustomSkillDefinitionInput(
+            skill_key="report_any_script",
+            name="设备报告",
+            description="从用户上传脚本输出生成报告。",
+            supported_subtask_types=["fault_report"],
+            input_artifact_types=["SemanticDocument"],
+            output_artifact_types=["TextReport"],
+            contract_profile_id="document_text_report",
+            integration_mode="SIDE_OUTPUT",
+            result_semantics="REPORT",
+            instruction_markdown="根据文档生成设备报告。",
+        )
+    )
+    await service.add_skill_resource(
+        skill.skill_id,
+        relative_path="main.py",
+        media_type="text/x-python",
+        content=b"def run(inputs, parameters): return {'headline': 'report'}\n",
+    )
+    check = await service.check_skill_contract(skill.skill_id)
+    assert check.status == "FAILED"
+    proposal = await service.propose_script_output_mapping(skill.skill_id)
+    assert [(item.source_pointer, item.target_field) for item in proposal.suggested_bindings] == [
+        ("/headline", "title")
+    ]
+    assert model.calls[0].output_model_name == "ScriptOutputMappingSelection"
+    assert "headline" in model.calls[0].user_prompt
+    assert "TextReport" in model.calls[0].user_prompt
+    await database.dispose()

@@ -1,0 +1,22 @@
+# 全局 Skill 调用权限清单。
+#
+# 此文件只回答一个运行时问题：某专业 Agent 是否允许调用某个 Skill。
+# Skill 自身的执行说明与实现仍位于 src/kg_agent/skills/catalog/<skill_name>/。
+skills:
+  build_document_manifest: [document_parsing_agent]
+  parse_document: [document_parsing_agent]
+  extract_ontology_candidates: [knowledge_extraction_agent]
+  extract_knowledge: [knowledge_extraction_agent]
+  align_ontology: [knowledge_fusion_agent]
+  fuse_ontology: [knowledge_fusion_agent]
+  align_entities: [knowledge_fusion_agent]
+  normalize_relations: [knowledge_fusion_agent]
+  analyze_conflicts: [knowledge_fusion_agent]
+  build_candidate_graph: [graph_management_agent]
+  generate_graph_changeset: [graph_management_agent]
+  evaluate_graph_quality: [quality_evaluation_agent]
+  evaluate_evidence_coverage: [quality_evaluation_agent]
+  apply_ontology_changeset: [graph_management_agent]
+  publish_ontology: [graph_management_agent]
+  apply_graph_changeset: [graph_management_agent]
+  publish_graph: [graph_management_agent]

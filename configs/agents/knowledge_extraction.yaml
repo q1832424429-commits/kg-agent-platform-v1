@@ -1,0 +1,23 @@
+agent_type: knowledge_extraction_agent
+name: 知识抽取 Agent
+version: 1.0.0
+description: 负责候选本体、实体、关系、属性和证据的抽取任务。
+accepted_subtask_types:
+  - ontology_extract
+  - knowledge_extract
+accepted_input_types:
+  - SemanticDocument
+  - PublishedOntology
+produced_output_types:
+  - CandidateOntology
+  - EntityDataset
+  - RelationDataset
+  - PropertyDataset
+  - EvidenceDataset
+allowed_skills:
+  - extract_ontology_candidates
+  - extract_knowledge
+can_publish_subtasks: false
+can_publish_ontology: false
+can_publish_graph: false
+lifecycle: ACTIVE
